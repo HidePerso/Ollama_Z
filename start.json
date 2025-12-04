@@ -1,0 +1,27 @@
+{
+  "run": [
+    {
+      "method": "shell.run",
+      "params": {
+        "venv": "venv",
+        "message": "python app.py",
+        "on": [{
+          "event": "/.*/",
+          "return": true
+        }]
+      }
+    },
+    {
+      "method": "local.set",
+      "params": {
+        "url": "http://localhost:11435"
+      }
+    },
+    {
+      "method": "browser.open",
+      "params": {
+        "uri": "{{local.url}}"
+      }
+    }
+  ]
+}

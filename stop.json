@@ -1,0 +1,10 @@
+{
+  "run": [
+    {
+      "method": "process.kill",
+      "params": {
+        "id": "{{kernel.pid(__dirname, 'start.json')}}"
+      }
+    }
+  ]
+}

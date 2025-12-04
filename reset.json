@@ -1,0 +1,16 @@
+{
+  "run": [
+    {
+      "method": "fs.rm",
+      "params": {
+        "path": "venv"
+      }
+    },
+    {
+      "method": "fs.rm",
+      "params": {
+        "path": "__pycache__"
+      }
+    }
+  ]
+}
