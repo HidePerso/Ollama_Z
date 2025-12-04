@@ -1,16 +1,23 @@
-from flask import Flask, render_template, request, jsonify, Response
+from flask import Flask, render_template, request, jsonify, Response, stream_with_context
 import subprocess
 import json
 import re
 from datetime import datetime
 import threading
 import time
+import requests
+import signal
+import os
 
 app = Flask(__name__)
 
-# Store active pull operations
+# Store active pull operations with process info for cancellation
 pull_progress = {}
 pull_threads = {}
+pull_processes = {}  # Store subprocess objects for cancellation
+
+# Store active chat generation
+active_generation = {"stop": False}
 
 OLLAMA_URL = "http://localhost:11434"
 
@@ -94,10 +101,21 @@ def pull_model_with_progress(model_name):
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            bufsize=1
+            bufsize=1,
+            encoding='utf-8',
+            errors='replace',
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
         )
         
+        # Store process for potential cancellation
+        pull_processes[model_name] = process
+        
         for line in iter(process.stdout.readline, ''):
+            # Check if cancelled
+            if model_name not in pull_progress or pull_progress[model_name]["status"] == "cancelled":
+                process.terminate()
+                break
+                
             if not line:
                 break
             
@@ -105,36 +123,110 @@ def pull_model_with_progress(model_name):
             if not line:
                 continue
             
-            # Parse progress from ollama output
-            if "pulling" in line.lower():
-                pull_progress[model_name]["message"] = line
-                pull_progress[model_name]["status"] = "pulling"
-                
-                # Try to extract percentage
-                percentage_match = re.search(r'(\d+)%', line)
-                if percentage_match:
-                    pull_progress[model_name]["progress"] = int(percentage_match.group(1))
-            elif "success" in line.lower():
+            # Always update with latest line for visibility
+            print(f"[{model_name}] {line}")  # Debug output
+            
+            # Parse different types of ollama output
+            if "success" in line.lower():
                 pull_progress[model_name]["status"] = "complete"
                 pull_progress[model_name]["progress"] = 100
                 pull_progress[model_name]["message"] = "Download complete!"
             elif "error" in line.lower() or "failed" in line.lower():
                 pull_progress[model_name]["status"] = "error"
                 pull_progress[model_name]["message"] = line
+                # Remove from global state after delay
+                time.sleep(5)
+                if model_name in pull_progress:
+                    del pull_progress[model_name]
+            else:
+                # Extract download progress info
+                pull_progress[model_name]["status"] = "pulling"
+                
+                # Try to extract size and speed: "943 MB/8.6 GB  3.2 MB/s"
+                size_match = re.search(r'([\d.]+\s*[KMG]B)\s*/\s*([\d.]+\s*[KMG]B)', line)
+                speed_match = re.search(r'([\d.]+\s*[KMG]B/s)', line)
+                percent_match = re.search(r'(\d+)%', line)
+                
+                if size_match:
+                    downloaded = size_match.group(1).strip()
+                    total = size_match.group(2).strip()
+                    speed = speed_match.group(1).strip() if speed_match else ""
+                    
+                    # Calculate percentage from sizes
+                    try:
+                        def parse_size(size_str):
+                            size_str = size_str.upper()
+                            value = float(re.search(r'[\d.]+', size_str).group())
+                            if 'GB' in size_str:
+                                return value * 1024
+                            elif 'KB' in size_str:
+                                return value / 1024
+                            else:  # MB
+                                return value
+                        
+                        downloaded_mb = parse_size(downloaded)
+                        total_mb = parse_size(total)
+                        percentage = int((downloaded_mb / total_mb) * 100) if total_mb > 0 else 0
+                        pull_progress[model_name]["progress"] = percentage
+                    except:
+                        pull_progress[model_name]["progress"] = 0
+                    
+                    # Format message
+                    msg_parts = [f"{downloaded}/{total}"]
+                    if speed:
+                        msg_parts.append(speed)
+                    pull_progress[model_name]["message"] = " | ".join(msg_parts)
+                elif percent_match:
+                    # If we have a percentage but no size info
+                    pull_progress[model_name]["progress"] = int(percent_match.group(1))
+                    pull_progress[model_name]["message"] = line
+                else:
+                    # Show raw line for other status messages
+                    pull_progress[model_name]["message"] = line
+                    if "manifest" in line.lower():
+                        pull_progress[model_name]["progress"] = 5
+                    elif "verify" in line.lower():
+                        pull_progress[model_name]["progress"] = 95
+            
+
         
         process.wait()
         
-        if process.returncode == 0 and pull_progress[model_name]["status"] != "error":
+        # Clean up process reference
+        if model_name in pull_processes:
+            del pull_processes[model_name]
+        
+        if pull_progress[model_name]["status"] == "cancelled":
+            pull_progress[model_name]["message"] = "Download cancelled"
+            # Remove from global state after delay
+            time.sleep(3)
+            if model_name in pull_progress:
+                del pull_progress[model_name]
+        elif process.returncode == 0 and pull_progress[model_name]["status"] != "error":
             pull_progress[model_name]["status"] = "complete"
             pull_progress[model_name]["progress"] = 100
             pull_progress[model_name]["message"] = f"Successfully pulled {model_name}"
-        elif pull_progress[model_name]["status"] != "error":
+            # Remove from global state after delay
+            time.sleep(5)
+            if model_name in pull_progress:
+                del pull_progress[model_name]
+        elif pull_progress[model_name]["status"] not in ["error", "cancelled"]:
             pull_progress[model_name]["status"] = "error"
             pull_progress[model_name]["message"] = "Download failed"
+            # Remove from global state after delay
+            time.sleep(10)
+            if model_name in pull_progress:
+                del pull_progress[model_name]
             
     except Exception as e:
         pull_progress[model_name]["status"] = "error"
         pull_progress[model_name]["message"] = str(e)
+        if model_name in pull_processes:
+            del pull_processes[model_name]
+        # Remove from global state after delay
+        time.sleep(10)
+        if model_name in pull_progress:
+            del pull_progress[model_name]
 
 @app.route('/')
 def index():
@@ -170,8 +262,8 @@ def pull_model():
     if model_name in pull_threads and pull_threads[model_name].is_alive():
         return jsonify({"success": False, "error": "Model is already being pulled"})
     
-    # Start pull in background thread
-    thread = threading.Thread(target=pull_model_with_progress, args=(model_name,))
+    # Start pull in background thread (allows multiple concurrent downloads)
+    thread = threading.Thread(target=pull_model_with_progress, args=(model_name,), daemon=True)
     thread.start()
     pull_threads[model_name] = thread
     
@@ -183,6 +275,45 @@ def get_pull_progress(model_name):
     if model_name in pull_progress:
         return jsonify(pull_progress[model_name])
     return jsonify({"status": "not_found"})
+
+@app.route('/api/pull/all')
+def get_all_pull_progress():
+    """Get progress of all active downloads"""
+    return jsonify(pull_progress)
+
+@app.route('/api/pull/cancel', methods=['POST'])
+def cancel_pull():
+    """Cancel a model download"""
+    data = request.json
+    model_name = data.get('model')
+    
+    if not model_name:
+        return jsonify({"success": False, "error": "Model name required"})
+    
+    if model_name in pull_progress:
+        pull_progress[model_name]["status"] = "cancelled"
+        
+        # Try to terminate the process
+        if model_name in pull_processes:
+            try:
+                process = pull_processes[model_name]
+                if os.name == 'nt':
+                    # Windows
+                    process.send_signal(signal.CTRL_BREAK_EVENT)
+                    time.sleep(0.5)
+                    process.terminate()
+                else:
+                    # Unix-like
+                    process.terminate()
+                    time.sleep(0.5)
+                    if process.poll() is None:
+                        process.kill()
+            except Exception as e:
+                print(f"Error terminating process: {e}")
+        
+        return jsonify({"success": True, "message": f"Cancelled download of {model_name}"})
+    
+    return jsonify({"success": False, "error": "Model download not found"})
 
 @app.route('/api/stop', methods=['POST'])
 def stop_model():
@@ -254,7 +385,7 @@ def show_model():
 
 @app.route('/api/chat', methods=['POST'])
 def chat():
-    """Chat with a model"""
+    """Chat with a model using streaming"""
     data = request.json
     model = data.get('model')
     message = data.get('message')
@@ -262,39 +393,96 @@ def chat():
     if not model or not message:
         return jsonify({"success": False, "error": "Model and message required"})
     
-    try:
-        # Use ollama run command for chat
-        result = subprocess.run(
-            f'ollama run {model} "{message}"',
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=120
-        )
-        
-        return jsonify({
-            "success": result.returncode == 0,
-            "response": result.stdout,
-            "error": result.stderr
-        })
-    except subprocess.TimeoutExpired:
-        return jsonify({
-            "success": False,
-            "response": "",
-            "error": "Chat request timed out"
-        })
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "response": "",
-            "error": str(e)
-        })
+    def generate():
+        active_generation["stop"] = False
+        try:
+            response = requests.post(
+                f"{OLLAMA_URL}/api/generate",
+                json={
+                    "model": model,
+                    "prompt": message,
+                    "stream": True
+                },
+                stream=True,
+                timeout=300
+            )
+            
+            for line in response.iter_lines():
+                if active_generation["stop"]:
+                    yield f"data: {json.dumps({'done': True, 'stopped': True})}\n\n"
+                    break
+                    
+                if line:
+                    try:
+                        chunk = json.loads(line)
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                        
+                        if chunk.get('done', False):
+                            break
+                    except json.JSONDecodeError:
+                        continue
+                        
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e), 'done': True})}\n\n"
+    
+    return Response(stream_with_context(generate()), mimetype='text/event-stream')
+
+@app.route('/api/chat/stop', methods=['POST'])
+def stop_chat():
+    """Stop the active chat generation"""
+    active_generation["stop"] = True
+    return jsonify({"success": True, "message": "Generation stopped"})
 
 @app.route('/api/serve', methods=['POST'])
 def serve_ollama():
     """Start ollama serve (if not already running)"""
     result = run_ollama_command("serve")
     return jsonify(result)
+
+@app.route('/api/kill', methods=['POST'])
+def kill_ollama():
+    """Kill all Ollama processes"""
+    try:
+        if os.name == 'nt':
+            # Windows
+            subprocess.run('taskkill /F /IM ollama.exe', shell=True, capture_output=True)
+            subprocess.run('taskkill /F /IM ollama_llama_server.exe', shell=True, capture_output=True)
+        else:
+            # Unix-like
+            subprocess.run('pkill -9 ollama', shell=True, capture_output=True)
+        
+        time.sleep(1)
+        return jsonify({"success": True, "message": "Ollama processes killed"})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+@app.route('/api/start', methods=['POST'])
+def start_ollama():
+    """Start Ollama serve in background"""
+    try:
+        if os.name == 'nt':
+            # Windows - start in background
+            subprocess.Popen(
+                'start /B ollama serve',
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+            )
+        else:
+            # Unix-like
+            subprocess.Popen(
+                'ollama serve &',
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                preexec_fn=os.setpgrp
+            )
+        
+        time.sleep(2)
+        return jsonify({"success": True, "message": "Ollama started"})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
 
 if __name__ == '__main__':
     print("Starting Ollama Web Interface on http://0.0.0.0:11435")

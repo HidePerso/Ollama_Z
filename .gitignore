@@ -44,3 +44,7 @@ desktop.ini
 
 # Pinokio
 .pinokio/
+
+# Cache and environment directories
+cache/
+ENVIRONMENT

@@ -4,16 +4,34 @@ A modern web interface for managing and interacting with Ollama models on localh
 
 ## Features
 
-- 🔄 **Monitor Running Models** - View all running models with resource usage and auto-unload timers
-- ⬇️ **Pull Models** - Download models with real-time progress bars
-- 📦 **Manage Models** - List all available models with size and modification info
-- 💬 **Chat Interface** - Test models with a simple chat interface
-- 🛠️ **Model Operations**:
-  - Copy models
-  - Rename models (copy + remove)
-  - Remove models
-  - Show detailed model information
-  - Stop running models
+### 🎨 Modern Dark Theme UI
+- Sleek glassmorphism design with gradient accents
+- Fully responsive - optimized for desktop, tablet, and mobile
+- Touch-friendly controls with proper hit targets
+
+### 🔄 Model Management
+- **Monitor Running Models** - View all running models with resource usage
+- **Start/Kill Ollama** - Control the Ollama service directly from the UI
+- **One-Click Run** - Load any model directly into chat interface
+
+### ⬇️ Smart Downloads
+- **Concurrent Downloads** - Download multiple models simultaneously
+- **Real-Time Progress** - Live progress bars with speed and size info (e.g., "943 MB/8.6 GB | 3.2 MB/s")
+- **Cancel Anytime** - Stop downloads mid-process
+- **Persistent Progress** - Downloads continue in background, visible to all users
+- **Auto-Cleanup** - Completed/failed downloads automatically removed
+
+### 💬 Streaming Chat Interface
+- **Real-Time Streaming** - See responses token-by-token as they generate
+- **Stop Generation** - Cancel responses mid-generation with pulsing stop button
+- **Model Switching** - Quickly switch between installed models
+- **Clean History** - Smooth chat bubbles with user/assistant styling
+
+### 🛠️ Per-Model Actions
+- **Run** - Load model into chat interface
+- **Info** - View detailed model information in modal
+- **Copy** - Duplicate models with new names
+- **Remove** - Delete models with confirmation
 
 ## Installation
 
@@ -89,18 +107,39 @@ Ollama_Web.git/
 
 ## API Endpoints
 
-- `GET /api/ps` - List running models
-- `GET /api/list` - List all models
-- `POST /api/pull` - Pull a model
-- `GET /api/pull/progress/<model>` - Get pull progress
-- `POST /api/stop` - Stop a running model
+### Model Management
+- `GET /api/ps` - List running models with resource info
+- `GET /api/list` - List all installed models
+- `POST /api/stop` - Stop a specific running model
 - `POST /api/rm` - Remove a model
-- `POST /api/cp` - Copy a model
-- `POST /api/rename` - Rename a model
-- `POST /api/show` - Show model info
-- `POST /api/chat` - Chat with a model
+- `POST /api/cp` - Copy a model to new name
+- `POST /api/show` - Get detailed model information
 
-## Configuration
+### Download Operations
+- `POST /api/pull` - Start downloading a model
+- `GET /api/pull/all` - Get all active download progress (real-time)
+- `GET /api/pull/progress/<model>` - Get specific model download progress
+- `POST /api/pull/cancel` - Cancel an active download
+
+### Chat Operations
+- `POST /api/chat` - Stream chat responses (Server-Sent Events)
+- `POST /api/chat/stop` - Stop active generation
+
+### Ollama Control
+- `POST /api/start` - Start Ollama service
+- `POST /api/kill` - Kill all Ollama processes
+- `POST /api/serve` - Start Ollama serve (deprecated, use /api/start)
+
+## Technical Details
+
+### Architecture
+- **Backend**: Flask with threading for concurrent operations
+- **Frontend**: Vanilla JavaScript (no build step required)
+- **Streaming**: Server-Sent Events (SSE) for chat responses
+- **Progress Tracking**: Global shared state with auto-cleanup
+- **Process Management**: Direct subprocess control for Ollama CLI
+
+### Configuration
 
 The server runs on `0.0.0.0:11435` by default and connects to Ollama at `localhost:11434`.
 
@@ -110,6 +149,11 @@ To change these settings, edit `app.py`:
 OLLAMA_URL = "http://localhost:11434"
 app.run(host='0.0.0.0', port=11435)
 ```
+
+### Browser Compatibility
+- Modern browsers with ES6+ support
+- ReadableStream API for streaming responses
+- CSS Grid and Flexbox for responsive layout
 
 ## License
 
