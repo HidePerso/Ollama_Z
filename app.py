@@ -10,12 +10,12 @@ import signal
 import os
 import psutil
 
-# Try to import GPUtil for GPU monitoring (optional)
+# Try to import GPUtil for GPU monitoring (optional, primarily for Windows)
 try:
     import GPUtil
-    GPU_AVAILABLE = True
+    GPUTIL_AVAILABLE = True
 except ImportError:
-    GPU_AVAILABLE = False
+    GPUTIL_AVAILABLE = False
 
 app = Flask(__name__)
 
@@ -93,6 +93,58 @@ def parse_list_output(output):
                 "modified": " ".join(parts[4:]) if len(parts) > 4 else ""
             })
     return models
+
+def get_gpu_stats():
+    """Get GPU statistics - works on both Linux (nvidia-smi) and Windows (GPUtil)"""
+    stats = {
+        'gpu_percent': 0,
+        'vram_percent': 0,
+        'vram_used': 0,
+        'vram_total': 0,
+        'gpu_available': False,
+        'gpu_name': 'N/A'
+    }
+    
+    # Try nvidia-smi first (Linux/Windows with NVIDIA)
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=index,name,utilization.gpu,memory.used,memory.total,memory.free', 
+             '--format=csv,noheader,nounits'],
+            capture_output=True,
+            text=True,
+            timeout=2
+        )
+        
+        if result.returncode == 0 and result.stdout.strip():
+            # Parse nvidia-smi output: index, name, utilization.gpu, memory.used, memory.total, memory.free
+            parts = [p.strip() for p in result.stdout.strip().split(',')]
+            if len(parts) >= 5:
+                stats['gpu_name'] = parts[1]
+                stats['gpu_percent'] = float(parts[2])
+                stats['vram_used'] = round(float(parts[3]) / 1024, 2)  # Convert MB to GB
+                stats['vram_total'] = round(float(parts[4]) / 1024, 2)  # Convert MB to GB
+                stats['vram_percent'] = round((float(parts[3]) / float(parts[4])) * 100, 1) if float(parts[4]) > 0 else 0
+                stats['gpu_available'] = True
+                return stats
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError, IndexError):
+        pass  # nvidia-smi not available or failed, try GPUtil
+    
+    # Fallback to GPUtil (primarily for Windows or non-NVIDIA)
+    if GPUTIL_AVAILABLE:
+        try:
+            gpus = GPUtil.getGPUs()
+            if gpus:
+                gpu = gpus[0]  # Use first GPU
+                stats['gpu_percent'] = round(gpu.load * 100, 1)
+                stats['vram_percent'] = round(gpu.memoryUtil * 100, 1)
+                stats['vram_used'] = round(gpu.memoryUsed / 1024, 2)  # GB
+                stats['vram_total'] = round(gpu.memoryTotal / 1024, 2)  # GB
+                stats['gpu_name'] = gpu.name
+                stats['gpu_available'] = True
+        except Exception:
+            pass  # GPUtil failed, return default values
+    
+    return stats
 
 def pull_model_with_progress(model_name):
     """Pull a model and track progress"""
@@ -519,29 +571,9 @@ def get_system_stats():
         stats['ram_used'] = round(ram.used / (1024**3), 2)  # GB
         stats['ram_total'] = round(ram.total / (1024**3), 2)  # GB
         
-        # GPU Usage (if available)
-        if GPU_AVAILABLE:
-            try:
-                gpus = GPUtil.getGPUs()
-                if gpus:
-                    gpu = gpus[0]  # Use first GPU
-                    stats['gpu_percent'] = round(gpu.load * 100, 1)
-                    stats['vram_percent'] = round(gpu.memoryUtil * 100, 1)
-                    stats['vram_used'] = round(gpu.memoryUsed / 1024, 2)  # GB
-                    stats['vram_total'] = round(gpu.memoryTotal / 1024, 2)  # GB
-                    stats['gpu_name'] = gpu.name
-                else:
-                    stats['gpu_percent'] = 0
-                    stats['vram_percent'] = 0
-                    stats['gpu_available'] = False
-            except Exception as e:
-                stats['gpu_percent'] = 0
-                stats['vram_percent'] = 0
-                stats['gpu_available'] = False
-        else:
-            stats['gpu_percent'] = 0
-            stats['vram_percent'] = 0
-            stats['gpu_available'] = False
+        # GPU Usage (cross-platform)
+        gpu_stats = get_gpu_stats()
+        stats.update(gpu_stats)
         
         return jsonify({"success": True, "stats": stats})
     except Exception as e:
