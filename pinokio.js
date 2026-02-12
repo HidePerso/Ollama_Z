@@ -1,5 +1,5 @@
 module.exports = {
-  title: "Ollama Web Interface",
+  title: "Ollama Zimage prompt helper",
   description: "A web interface for managing and interacting with Ollama models",
   icon: "icon.png",
   menu: async (kernel, info) => {

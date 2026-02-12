@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Ollama Web Interface</title>
+    <title>Ollama Zimage prompt helper</title>
     <style>
         * {
             margin: 0;
@@ -642,7 +642,7 @@
 <body>
     <div class="container">
         <header>
-            <h1>🦙 Ollama Web Interface</h1>
+            <h1>🦙 Ollama Zimage prompt helper</h1>
             <p class="subtitle">Manage and interact with your Ollama models</p>
         </header>
 
@@ -705,17 +705,16 @@
                             description):</label>
                         <textarea id="pipelineInput"
                             style="width: 100%; flex: 1; min-height: 380px; resize: vertical; background: rgba(15, 15, 35, 0.8); border: 1px solid rgba(129, 140, 248, 0.3); border-radius: 8px; padding: 12px; color: #e4e4e7; font-family: inherit; line-height: 1.5;"
-                            placeholder="Введите описание сцены на русском или английском языке..."></textarea>
+                            placeholder="Enter a scene description in Russian or English..."></textarea>
                     </div>
 
                     <button id="compileButton" onclick="compilePipeline()"
-                        style="width: 100%; margin-top: 15px; padding: 16px; font-size: 1.1em;">🚀
-                        Скомпилировать</button>
+                        style="width: 100%; margin-top: 15px; padding: 16px; font-size: 1.1em;">🚀 Compile</button>
 
                     <!-- Status -->
                     <div id="pipelineStatus"
                         style="padding: 12px; background: rgba(15, 15, 35, 0.5); border: 1px solid rgba(129, 140, 248, 0.2); border-radius: 8px; margin-top: 15px; font-size: 0.95em; color: #a5b4fc; display: none; text-align: center; font-weight: 600;">
-                        Готово.
+                        Ready.
                     </div>
                 </div>
 
@@ -1449,7 +1448,7 @@
                         }
 
                         statusEl.style.color = '#34d399';
-                        statusEl.textContent = '✅ Готово.';
+                        statusEl.textContent = '✅ Ready.';
 
                         showNotification('Pipeline completed successfully!', 'success');
                     } else {
@@ -1487,7 +1486,7 @@
                 })
                 .finally(() => {
                     compileBtn.disabled = false;
-                    compileBtn.textContent = '🚀 Скомпилировать';
+                    compileBtn.textContent = '🚀 Compile';
                 });
         }
 
