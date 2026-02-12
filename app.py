@@ -9,7 +9,9 @@ import requests
 import signal
 import os
 import psutil
-import webbrowser
+import os
+import psutil
+# import webbrowser
 
 # Try to import GPUtil for GPU monitoring (optional, primarily for Windows)
 try:
@@ -779,10 +781,10 @@ def add_header(response):
     return response
 
 if __name__ == '__main__':
-    print("Starting Ollama Web Interface on http://0.0.0.0:11435")
+    print("Starting Ollama Web Interface on http://localhost:11435")
     
-    # Auto-open browser only once (not on reloader)
-    if os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
-        threading.Timer(1.5, lambda: webbrowser.open('http://localhost:11435')).start()
+    # Auto-open browser disabled for Pinokio internal WebUI
+    # if os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
+    #     threading.Timer(1.5, lambda: webbrowser.open('http://localhost:11435')).start()
         
-    app.run(host='0.0.0.0', port=11435, debug=True)
+    app.run(host='0.0.0.0', port=11435, debug=False)
