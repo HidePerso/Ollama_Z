@@ -9,6 +9,7 @@ import requests
 import signal
 import os
 import psutil
+import webbrowser
 
 # Try to import GPUtil for GPU monitoring (optional, primarily for Windows)
 try:
@@ -19,15 +20,126 @@ except ImportError:
 
 app = Flask(__name__)
 
-# Store active pull operations with process info for cancellation
+# Store active downloads
 pull_progress = {}
 pull_threads = {}
 pull_processes = {}  # Store subprocess objects for cancellation
 
-# Store active chat generation
-active_generation = {"stop": False}
-
 OLLAMA_URL = "http://localhost:11434"
+
+# -----------------------------
+# Pipeline System Prompts
+# -----------------------------
+
+TRANSLATOR_SYSTEM = """You are a literal translator.
+
+Translate the user text into English.
+
+Rules:
+- Preserve all explicit details.
+- Preserve numbers, age, nationality, colors, object placement, and spatial relations.
+- Do not summarize.
+- Do not interpret.
+- Do not embellish.
+- Keep meaning exact.
+- Output only the translation in English.
+"""
+
+EXTRACTOR_SYSTEM = """You are a factual extractor.
+
+Convert the user description into atomic factual statements.
+
+This is a LOSSLESS transformation.
+
+Rules:
+- Do not remove any explicit detail from the input.
+- Do not generalize (e.g., do not replace "35-year-old German woman" with "adult woman").
+- Do not interpret or infer missing details.
+- Do not add any new objects, textures, brands, or micro-details.
+- Preserve numbers, age, nationality, colors, object placement, and spatial relations.
+- One fact per line.
+- No headings, no blocks, no commentary.
+- Output only the list of facts.
+- Output language: English only.
+"""
+
+STRUCTURER_SYSTEM = """You are a structural scene organizer for zimage / Flux-based models.
+
+You will receive:
+- Original description (English)
+- Extracted atomic facts (English)
+
+Your task:
+- Organize facts into structured blocks.
+- LOSSLESS: every explicit detail from the input must appear in the output.
+- Do not add anything new.
+- Do not change age, nationality, colors, counts, placements.
+- Preserve spatial relationships and perspective constraints.
+- Use short atomic statements.
+- Output language: English only.
+- Output only the structured prompt.
+
+Output format (omit irrelevant sections):
+
+[Perspective]
+Viewer position and viewing constraints
+
+[Subject]
+All characters with age, nationality
+
+[Body]
+Body position and anatomy
+
+[Face]
+Facial orientation and visibility
+
+[Hair]
+Hairstyle details
+
+[Clothing]
+All garments and exposure state
+
+[Pose]
+Body position and orientation
+
+[Environment]
+Room condition and objects
+
+[Lighting]
+Light source, direction, shadows
+
+[Camera]
+Framing and spatial compression
+
+[Style]
+Rendering style (only if explicitly present or requested by the user)
+
+[Details]
+Only details explicitly present in input (no invented micro-details)
+
+[Negative]
+Explicitly disallowed additions (no extra people, no extra objects, no text/logos)
+"""
+
+VALIDATOR_SYSTEM = """You are a strict validator and fixer for a zimage structured prompt.
+
+You will receive:
+- Original description (English)
+- Extracted atomic facts (English)
+- Candidate structured prompt (English)
+
+Your task:
+1) Check that every explicit detail from the original description and facts is present in the candidate structured prompt.
+2) Check that the candidate does not add anything not present in the original/facts.
+3) If anything is missing or added or generalized, rewrite the structured prompt to fix it.
+
+Rules:
+- Output ONLY the corrected structured prompt (no explanations).
+- Keep the same block format as provided.
+- Preserve all explicit details. Do not add new information.
+- Do not generalize numbers, ages, nationalities, colors, or counts.
+- Output language: English only.
+"""
 
 def run_ollama_command(command):
     """Run an ollama command and return the output"""
@@ -288,6 +400,67 @@ def pull_model_with_progress(model_name):
         if model_name in pull_progress:
             del pull_progress[model_name]
 
+# -----------------------------
+# Pipeline Helper Functions
+# -----------------------------
+
+def normalize_facts(text: str) -> str:
+    """Normalize facts list by removing bullets and numbering"""
+    lines = []
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        # Remove bullets and numbering
+        s = re.sub(r'^\s*[-*•]\s+', '', s)
+        s = re.sub(r'^\s*\d+[.)]\s+', '', s)
+        lines.append(s)
+    return '\n'.join(lines).strip()
+
+def has_cyrillic(text: str, threshold: float = 0.3) -> bool:
+    """Check if text has more than threshold% of Cyrillic characters"""
+    if not text:
+        return False
+    
+    # Count Cyrillic characters
+    cyrillic_count = len(re.findall(r'[\u0400-\u04FF]', text))
+    # Count total letters (excluding spaces, punctuation, etc.)
+    letter_count = len(re.findall(r'[\w]', text, re.UNICODE))
+    
+    if letter_count == 0:
+        return False
+    
+    cyrillic_ratio = cyrillic_count / letter_count
+    return cyrillic_ratio > threshold
+
+def ollama_generate_sync(model: str, prompt: str, temperature: float = 0.1, timeout: int = 300) -> str:
+    """Synchronous Ollama generation with configurable timeout"""
+    try:
+        response = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": temperature,
+                    "top_p": 0.85,
+                    "repeat_penalty": 1.15,
+                    "num_ctx": 4096
+                }
+            },
+            timeout=timeout
+        )
+        response.raise_for_status()
+        data = response.json()
+        return (data.get('response') or '').strip()
+    except requests.exceptions.Timeout:
+        raise Exception(f"Request to model '{model}' timed out after {timeout} seconds")
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Error calling model '{model}': {str(e)}")
+    except Exception as e:
+        raise Exception(f"Unexpected error with model '{model}': {str(e)}")
+
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -443,67 +616,6 @@ def show_model():
     result = run_ollama_command(f"show {model_name}")
     return jsonify(result)
 
-@app.route('/api/chat', methods=['POST'])
-def chat():
-    """Chat with a model using streaming"""
-    data = request.json
-    model = data.get('model')
-    message = data.get('message')
-    context = data.get('context', [])  # Get conversation history
-    
-    if not model or not message:
-        return jsonify({"success": False, "error": "Model and message required"})
-    
-    def generate():
-        active_generation["stop"] = False
-        try:
-            # Build full prompt with conversation history
-            full_prompt = ""
-            for msg in context:
-                role = msg.get('role', 'user')
-                content = msg.get('content', '')
-                if role == 'user':
-                    full_prompt += f"User: {content}\n"
-                elif role == 'assistant':
-                    full_prompt += f"Assistant: {content}\n"
-            full_prompt += f"User: {message}\nAssistant:"
-            
-            response = requests.post(
-                f"{OLLAMA_URL}/api/generate",
-                json={
-                    "model": model,
-                    "prompt": full_prompt,
-                    "stream": True
-                },
-                stream=True,
-                timeout=300
-            )
-            
-            for line in response.iter_lines():
-                if active_generation["stop"]:
-                    yield f"data: {json.dumps({'done': True, 'stopped': True})}\n\n"
-                    break
-                    
-                if line:
-                    try:
-                        chunk = json.loads(line)
-                        yield f"data: {json.dumps(chunk)}\n\n"
-                        
-                        if chunk.get('done', False):
-                            break
-                    except json.JSONDecodeError:
-                        continue
-                        
-        except Exception as e:
-            yield f"data: {json.dumps({'error': str(e), 'done': True})}\n\n"
-    
-    return Response(stream_with_context(generate()), mimetype='text/event-stream')
-
-@app.route('/api/chat/stop', methods=['POST'])
-def stop_chat():
-    """Stop the active chat generation"""
-    active_generation["stop"] = True
-    return jsonify({"success": True, "message": "Generation stopped"})
 
 @app.route('/api/serve', methods=['POST'])
 def serve_ollama():
@@ -579,6 +691,98 @@ def get_system_stats():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
 
+@app.route('/api/compile', methods=['POST'])
+def compile_prompt():
+    """Compile prompt through the pipeline: translate → extract → structure → validate"""
+    try:
+        data = request.json
+        text = data.get('text', '').strip()
+        mode = data.get('mode', '2-stage')
+        translator_model = data.get('translator_model', '')
+        extractor_model = data.get('extractor_model', '')
+        structurer_model = data.get('structurer_model', '')
+        validator_model = data.get('validator_model', '')
+        
+        if not text:
+            return jsonify({"success": False, "error": "Text is required", "stage": "input"})
+        
+        if not extractor_model or not structurer_model:
+            return jsonify({"success": False, "error": "Extractor and Structurer models are required", "stage": "input"})
+        
+        # Stage 0: Translation (if needed)
+        input_en = text
+        if has_cyrillic(text, threshold=0.3):
+            if not translator_model:
+                return jsonify({"success": False, "error": "Translator model is required for Russian text", "stage": "translation"})
+            
+            try:
+                translator_prompt = f"{TRANSLATOR_SYSTEM}\n\nUSER TEXT:\n{text}\n"
+                input_en = ollama_generate_sync(translator_model, translator_prompt, temperature=0.05, timeout=300)
+            except Exception as e:
+                return jsonify({"success": False, "error": str(e), "stage": "translation"})
+        
+        # Stage 1: Extract facts
+        try:
+            extractor_prompt = f"{EXTRACTOR_SYSTEM}\n\nUSER DESCRIPTION (English):\n{input_en}\n"
+            facts_raw = ollama_generate_sync(extractor_model, extractor_prompt, temperature=0.10, timeout=300)
+            facts = normalize_facts(facts_raw)
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e), "stage": "extraction", "input_en": input_en})
+        
+        # Stage 2: Structure
+        structured = ""
+        try:
+            structurer_prompt = (
+                f"{STRUCTURER_SYSTEM}\n\n"
+                f"ORIGINAL DESCRIPTION (English):\n{input_en}\n\n"
+                f"ATOMIC FACTS (one per line, English):\n{facts}\n\n"
+                f"OUTPUT ONLY THE STRUCTURED PROMPT (English):\n"
+            )
+            structured = ollama_generate_sync(structurer_model, structurer_prompt, temperature=0.15, timeout=300)
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e), "stage": "structuring", "input_en": input_en, "facts": facts})
+        
+        # Stage 3: Validate (optional)
+        if mode == '3-stage':
+            if not validator_model:
+                return jsonify({"success": False, "error": "Validator model is required for 3-stage mode", "stage": "validation"})
+            
+            try:
+                validator_prompt = (
+                    f"{VALIDATOR_SYSTEM}\n\n"
+                    f"ORIGINAL DESCRIPTION (English):\n{input_en}\n\n"
+                    f"ATOMIC FACTS (English):\n{facts}\n\n"
+                    f"CANDIDATE STRUCTURED PROMPT (English):\n{structured}\n\n"
+                    f"OUTPUT ONLY THE CORRECTED STRUCTURED PROMPT (English):\n"
+                )
+                structured = ollama_generate_sync(validator_model, validator_prompt, temperature=0.12, timeout=300)
+            except Exception as e:
+                return jsonify({"success": False, "error": str(e), "stage": "validation", "input_en": input_en, "facts": facts, "structured": structured})
+        
+        return jsonify({
+            "success": True,
+            "input_en": input_en,
+            "facts": facts,
+            "structured": structured
+        })
+        
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e), "stage": "unknown"})
+
+@app.after_request
+def add_header(response):
+    """Add headers to both force latest IE rendering engine or 
+    to disable caching."""
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, post-check=0, pre-check=0, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '-1'
+    return response
+
 if __name__ == '__main__':
     print("Starting Ollama Web Interface on http://0.0.0.0:11435")
-    app.run(host='0.0.0.0', port=11435, debug=False)
+    
+    # Auto-open browser only once (not on reloader)
+    if os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
+        threading.Timer(1.5, lambda: webbrowser.open('http://localhost:11435')).start()
+        
+    app.run(host='0.0.0.0', port=11435, debug=True)
