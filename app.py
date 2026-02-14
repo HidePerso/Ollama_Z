@@ -21,6 +21,7 @@ except ImportError:
     GPUTIL_AVAILABLE = False
 
 app = Flask(__name__)
+SETTINGS_FILE = "pipeline_settings.json"
 
 # Store active downloads
 pull_progress = {}
@@ -175,24 +176,6 @@ def run_ollama_command(command):
                 "error": str(e)
             }
 
-def parse_ps_output(output):
-    """Parse the output of ollama ps command"""
-    lines = output.strip().split('\n')
-    if len(lines) < 2:
-        return []
-    
-    models = []
-    for line in lines[1:]:  # Skip header
-        parts = line.split()
-        if len(parts) >= 6:
-            models.append({
-                "name": parts[0],
-                "id": parts[1],
-                "size": f"{parts[2]} {parts[3]}",
-                "processor": parts[4],
-                "until": " ".join(parts[5:])
-            })
-    return models
 
 def parse_list_output(output):
     """Parse the output of ollama list command"""
@@ -471,14 +454,6 @@ def ollama_generate_sync(model: str, prompt: str, temperature: float = 0.1, time
 def index():
     return render_template('index.html')
 
-@app.route('/api/ps')
-def get_running_models():
-    """Get list of running models"""
-    result = run_ollama_command("ps")
-    if result["success"]:
-        models = parse_ps_output(result["output"])
-        return jsonify({"success": True, "models": models})
-    return jsonify({"success": False, "error": result["error"]})
 
 @app.route('/api/list')
 def get_model_list():
@@ -554,17 +529,6 @@ def cancel_pull():
     
     return jsonify({"success": False, "error": "Model download not found"})
 
-@app.route('/api/stop', methods=['POST'])
-def stop_model():
-    """Stop a running model"""
-    data = request.json
-    model_name = data.get('model')
-    
-    if not model_name:
-        return jsonify({"success": False, "error": "Model name required"})
-    
-    result = run_ollama_command(f"stop {model_name}")
-    return jsonify(result)
 
 @app.route('/api/rm', methods=['POST'])
 def remove_model():
@@ -622,58 +586,6 @@ def show_model():
     result = run_ollama_command(f"show {model_name}")
     return jsonify(result)
 
-
-@app.route('/api/serve', methods=['POST'])
-def serve_ollama():
-    """Start ollama serve (if not already running)"""
-    result = run_ollama_command("serve")
-    return jsonify(result)
-
-@app.route('/api/kill', methods=['POST'])
-def kill_ollama():
-    """Kill all Ollama processes"""
-    try:
-        if os.name == 'nt':
-            # Windows
-            subprocess.run('taskkill /F /IM ollama.exe', shell=True, capture_output=True)
-            subprocess.run('taskkill /F /IM ollama_llama_server.exe', shell=True, capture_output=True)
-        else:
-            # Unix-like
-            subprocess.run('pkill -9 ollama', shell=True, capture_output=True)
-        
-        time.sleep(1)
-        return jsonify({"success": True, "message": "Ollama processes killed"})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
-
-@app.route('/api/start', methods=['POST'])
-def start_ollama():
-    """Start Ollama serve in background"""
-    try:
-        if os.name == 'nt':
-            # Windows - start in background
-            subprocess.Popen(
-                'start /B ollama serve',
-                shell=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-            )
-        else:
-            # Unix-like
-            subprocess.Popen(
-                'ollama serve &',
-                shell=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                preexec_fn=os.setpgrp
-            )
-        
-        time.sleep(2)
-        return jsonify({"success": True, "message": "Ollama started"})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
-
 @app.route('/api/system/stats', methods=['GET'])
 def get_system_stats():
     """Get system resource usage statistics"""
@@ -694,6 +606,29 @@ def get_system_stats():
         stats.update(gpu_stats)
         
         return jsonify({"success": True, "stats": stats})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+@app.route('/api/settings/save', methods=['POST'])
+def save_settings():
+    """Save pipeline settings to a JSON file"""
+    try:
+        data = request.json
+        with open(SETTINGS_FILE, 'w') as f:
+            json.dump(data, f)
+        return jsonify({"success": True, "message": "Settings saved"})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+@app.route('/api/settings/load', methods=['GET'])
+def load_settings():
+    """Load pipeline settings from JSON file"""
+    try:
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, 'r') as f:
+                data = json.load(f)
+            return jsonify({"success": True, "settings": data})
+        return jsonify({"success": False, "error": "No settings found"})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
 

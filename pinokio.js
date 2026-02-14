@@ -1,6 +1,6 @@
 module.exports = {
   version: "3.7",
-  title: "Ollama Zimage prompt helper",
+  title: "Ollama Prompt Helper",
   description: "A web interface for managing and interacting with Ollama models",
   icon: "icon.png",
   menu: async (kernel, info) => {

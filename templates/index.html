@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Ollama Zimage prompt helper</title>
+    <title>Ollama Prompt Helper</title>
     <style>
         * {
             margin: 0;
@@ -247,16 +247,28 @@
 
         .stat-item {
             background: rgba(15, 15, 35, 0.4);
-            padding: 12px;
+            padding: 10px 12px;
             border-radius: 10px;
             border: 1px solid rgba(129, 140, 248, 0.1);
         }
 
+        .stat-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 6px;
+        }
+
         .stat-label {
-            font-size: 0.8em;
+            font-size: 0.75em;
             color: #a1a1aa;
-            margin-bottom: 5px;
             font-weight: 600;
+        }
+
+        .stat-value {
+            font-size: 0.8em;
+            font-weight: 700;
+            color: #e4e4e7;
         }
 
         .stat-bar {
@@ -266,7 +278,6 @@
             border-radius: 3px;
             overflow: hidden;
             border: 1px solid rgba(129, 140, 248, 0.1);
-            margin-bottom: 5px;
         }
 
         .stat-bar-fill {
@@ -283,12 +294,6 @@
             background: linear-gradient(90deg, #f87171, #ef4444);
         }
 
-        .stat-value {
-            font-size: 0.85em;
-            font-weight: 700;
-            color: #e4e4e7;
-            text-align: right;
-        }
 
         .progress-item {
             margin-bottom: 15px;
@@ -395,6 +400,36 @@
         select option {
             background: #1a1a2e;
             color: #e4e4e7;
+        }
+
+        select.invalid {
+            border-color: #ef4444 !important;
+            box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.1) !important;
+            animation: shake 0.4s cubic-bezier(.36, .07, .19, .97) both;
+        }
+
+        @keyframes shake {
+
+            10%,
+            90% {
+                transform: translate3d(-1px, 0, 0);
+            }
+
+            20%,
+            80% {
+                transform: translate3d(2px, 0, 0);
+            }
+
+            30%,
+            50%,
+            70% {
+                transform: translate3d(-4px, 0, 0);
+            }
+
+            40%,
+            60% {
+                transform: translate3d(4px, 0, 0);
+            }
         }
 
         .notification {
@@ -642,40 +677,47 @@
 <body>
     <div class="container">
         <header>
-            <h1>🦙 Ollama Zimage prompt helper</h1>
-            <p class="subtitle">Manage and interact with your Ollama models</p>
+            <h1>🦙 Ollama Prompt Helper</h1>
         </header>
 
         <!-- System Resource Monitor -->
         <div class="card" style="margin-bottom: 20px;">
             <div class="system-stats-grid">
                 <div class="stat-item">
-                    <div class="stat-label">💻 CPU</div>
+                    <div class="stat-header">
+                        <div class="stat-label">💻 CPU</div>
+                        <div class="stat-value" id="cpuValue">0%</div>
+                    </div>
                     <div class="stat-bar">
                         <div id="cpuBar" class="stat-bar-fill" style="width: 0%"></div>
                     </div>
-                    <div class="stat-value" id="cpuValue">0%</div>
                 </div>
                 <div class="stat-item">
-                    <div class="stat-label">🧠 RAM</div>
+                    <div class="stat-header">
+                        <div class="stat-label">🧠 RAM</div>
+                        <div class="stat-value" id="ramValue">0%</div>
+                    </div>
                     <div class="stat-bar">
                         <div id="ramBar" class="stat-bar-fill" style="width: 0%"></div>
                     </div>
-                    <div class="stat-value" id="ramValue">0%</div>
                 </div>
                 <div class="stat-item" id="gpuStat">
-                    <div class="stat-label">🎮 GPU</div>
+                    <div class="stat-header">
+                        <div class="stat-label">🎮 GPU</div>
+                        <div class="stat-value" id="gpuValue">N/A</div>
+                    </div>
                     <div class="stat-bar">
                         <div id="gpuBar" class="stat-bar-fill" style="width: 0%"></div>
                     </div>
-                    <div class="stat-value" id="gpuValue">N/A</div>
                 </div>
                 <div class="stat-item" id="vramStat">
-                    <div class="stat-label">📊 VRAM</div>
+                    <div class="stat-header">
+                        <div class="stat-label">📊 VRAM</div>
+                        <div class="stat-value" id="vramValue">N/A</div>
+                    </div>
                     <div class="stat-bar">
                         <div id="vramBar" class="stat-bar-fill" style="width: 0%"></div>
                     </div>
-                    <div class="stat-value" id="vramValue">N/A</div>
                 </div>
             </div>
         </div>
@@ -732,7 +774,8 @@
                                     <label
                                         style="display: block; margin-bottom: 6px; font-size: 0.85em; color: #a1a1aa;">Translator:</label>
                                     <select id="translatorModel" class="small-select"
-                                        style="padding: 8px; font-size: 0.85em;">
+                                        style="padding: 8px; font-size: 0.85em;"
+                                        onchange="this.classList.remove('invalid')">
                                         <option value="">Loading...</option>
                                     </select>
                                 </div>
@@ -740,7 +783,8 @@
                                     <label
                                         style="display: block; margin-bottom: 6px; font-size: 0.85em; color: #a1a1aa;">Extractor:</label>
                                     <select id="extractorModel" class="small-select"
-                                        style="padding: 8px; font-size: 0.85em;">
+                                        style="padding: 8px; font-size: 0.85em;"
+                                        onchange="this.classList.remove('invalid')">
                                         <option value="">Loading...</option>
                                     </select>
                                 </div>
@@ -748,7 +792,8 @@
                                     <label
                                         style="display: block; margin-bottom: 6px; font-size: 0.85em; color: #a1a1aa;">Structurer:</label>
                                     <select id="structurerModel" class="small-select"
-                                        style="padding: 8px; font-size: 0.85em;">
+                                        style="padding: 8px; font-size: 0.85em;"
+                                        onchange="this.classList.remove('invalid')">
                                         <option value="">Loading...</option>
                                     </select>
                                 </div>
@@ -756,10 +801,15 @@
                                     <label
                                         style="display: block; margin-bottom: 6px; font-size: 0.85em; color: #a1a1aa;">Validator:</label>
                                     <select id="validatorModel" class="small-select"
-                                        style="padding: 8px; font-size: 0.85em;">
+                                        style="padding: 8px; font-size: 0.85em;"
+                                        onchange="this.classList.remove('invalid')">
                                         <option value="">Loading...</option>
                                     </select>
                                 </div>
+                            </div>
+                            <div style="margin-top: 15px; text-align: right;">
+                                <button class="small" onclick="savePipelineSettings()" id="saveSettingsBtn">💾 Save
+                                    Settings</button>
                             </div>
                         </div>
                     </div>
@@ -806,25 +856,6 @@
         </div>
 
         <div class="grid">
-            <!-- Running Models -->
-            <div class="card collapsed" id="runningModelsCard">
-                <div class="card-header-toggle" onclick="toggleCard('runningModelsCard')">
-                    <h2 style="margin: 0; border: none; padding: 0;">🔄 Running Models</h2>
-                </div>
-                <div class="collapsible-content">
-                    <div style="display: flex; gap: 8px; margin: 15px 0; flex-wrap: wrap;">
-                        <button class="small success" onclick="startOllama()">▶ Start Ollama</button>
-                        <button class="small danger" onclick="killOllama()">⏹ Kill Ollama</button>
-                    </div>
-                    <div id="runningModels" class="model-list">
-                        <div class="empty-state">
-                            <div class="loading"></div>
-                            <p>Loading...</p>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
             <!-- Pull Model -->
             <div class="card collapsed" id="pullModelCard">
                 <div class="card-header-toggle" onclick="toggleCard('pullModelCard')">
@@ -876,6 +907,7 @@
 
     <script>
         let pullingModels = new Set();
+        let savedSettings = null;
 
         function showNotification(message, type = 'success') {
             const notification = document.getElementById('notification');
@@ -937,30 +969,6 @@
             }
         }
 
-        function loadRunningModels() {
-            fetch('/api/ps')
-                .then(r => r.json())
-                .then(data => {
-                    const container = document.getElementById('runningModels');
-                    if (data.success && data.models.length > 0) {
-                        container.innerHTML = data.models.map(m => `
-                            <div class="model-item">
-                                <div class="model-info">
-                                    <div class="model-name">${m.name}</div>
-                                    <div class="model-details">
-                                        Size: ${m.size} | Processor: ${m.processor} | Until: ${m.until}
-                                    </div>
-                                </div>
-                                <div class="model-actions">
-                                    <button class="small danger" onclick="stopModel('${m.name}')">Stop</button>
-                                </div>
-                            </div>
-                        `).join('');
-                    } else {
-                        container.innerHTML = '<div class="empty-state"><p>No models running</p></div>';
-                    }
-                });
-        }
 
         function loadAvailableModels() {
             fetch('/api/list')
@@ -1120,64 +1128,7 @@
                 });
         }
 
-        function stopModel(modelName) {
-            fetch('/api/stop', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ model: modelName })
-            })
-                .then(r => r.json())
-                .then(data => {
-                    if (data.success) {
-                        showNotification(`Stopped ${modelName}`);
-                        loadRunningModels();
-                    } else {
-                        showNotification(data.error, 'error');
-                    }
-                });
-        }
 
-        function killOllama() {
-            if (!confirm('Kill all Ollama processes? This will stop all running models.')) return;
-
-            showNotification('Killing Ollama...');
-            fetch('/api/kill', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' }
-            })
-                .then(r => r.json())
-                .then(data => {
-                    if (data.success) {
-                        showNotification('Ollama killed successfully');
-                        setTimeout(() => {
-                            loadRunningModels();
-                            loadAvailableModels();
-                        }, 1000);
-                    } else {
-                        showNotification(data.error, 'error');
-                    }
-                });
-        }
-
-        function startOllama() {
-            showNotification('Starting Ollama...');
-            fetch('/api/start', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' }
-            })
-                .then(r => r.json())
-                .then(data => {
-                    if (data.success) {
-                        showNotification('Ollama started successfully');
-                        setTimeout(() => {
-                            loadRunningModels();
-                            loadAvailableModels();
-                        }, 2000);
-                    } else {
-                        showNotification(data.error, 'error');
-                    }
-                });
-        }
 
         function removeModel(modelName) {
             if (!confirm(`Are you sure you want to remove ${modelName}?`)) return;
@@ -1274,16 +1225,57 @@
                                 option.textContent = model.name;
                                 select.appendChild(option);
                             });
-                            if (currentValue) select.value = currentValue;
+
+                            // Restore saved value if available, otherwise keep current
+                            if (savedSettings && savedSettings[selectId]) {
+                                select.value = savedSettings[selectId];
+                            } else if (currentValue) {
+                                select.value = currentValue;
+                            }
                         });
 
-                        // Intelligent auto-selection
-                        autoSelectPipelineModels(models.map(m => m.name));
+                        // Intelligent auto-selection (only if no saved settings)
+                        if (!savedSettings) {
+                            autoSelectPipelineModels(models.map(m => m.name));
+                        }
                     }
                 })
                 .catch(err => {
                     console.error('Error loading models:', err);
                     showNotification('Failed to load models', 'error');
+                });
+        }
+
+        function savePipelineSettings() {
+            const settings = {
+                translatorModel: document.getElementById('translatorModel').value,
+                extractorModel: document.getElementById('extractorModel').value,
+                structurerModel: document.getElementById('structurerModel').value,
+                validatorModel: document.getElementById('validatorModel').value
+            };
+
+            const saveBtn = document.getElementById('saveSettingsBtn');
+            saveBtn.disabled = true;
+            saveBtn.textContent = '⏳ Saving...';
+
+            fetch('/api/settings/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(settings)
+            })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        showNotification('Pipeline settings saved successfully!');
+                        savedSettings = settings;
+                    } else {
+                        showNotification('Error saving settings: ' + data.error, 'error');
+                    }
+                })
+                .catch(err => showNotification('Network error: ' + err.message, 'error'))
+                .finally(() => {
+                    saveBtn.disabled = false;
+                    saveBtn.textContent = '💾 Save Settings';
                 });
         }
 
@@ -1321,13 +1313,33 @@
                 return;
             }
 
-            if (!extractor_model || !structurer_model) {
-                showNotification('Please select Extractor and Structurer models', 'error');
-                return;
+            // Pre-run validation for models
+            let hasErrors = false;
+            const requiredModels = [
+                { id: 'extractorModel', name: 'Extractor' },
+                { id: 'structurerModel', name: 'Structurer' }
+            ];
+            if (mode === '3-stage') {
+                requiredModels.push({ id: 'validatorModel', name: 'Validator' });
             }
 
-            if (mode === '3-stage' && !validator_model) {
-                showNotification('Please select Validator model for 3-stage mode', 'error');
+            requiredModels.forEach(m => {
+                const el = document.getElementById(m.id);
+                if (!el.value) {
+                    el.classList.add('invalid');
+                    hasErrors = true;
+                } else {
+                    el.classList.remove('invalid');
+                }
+            });
+
+            if (hasErrors) {
+                // Expand settings if hidden
+                const settingsCard = document.getElementById('pipelineSettingsCard');
+                if (settingsCard.classList.contains('collapsed')) {
+                    settingsCard.classList.remove('collapsed');
+                }
+                showNotification('Please select required models in Pipeline Settings', 'error');
                 return;
             }
 
@@ -1503,14 +1515,24 @@
         async function initApp() {
             console.log("Initializing App...");
 
+            // 0. Load saved settings first
+            try {
+                const response = await fetch('/api/settings/load');
+                const data = await response.json();
+                if (data.success && data.settings) {
+                    savedSettings = data.settings;
+                    // Collapse settings card if settings were loaded
+                    document.getElementById('pipelineSettingsCard').classList.add('collapsed');
+                }
+            } catch (err) {
+                console.error('Error loading saved settings:', err);
+            }
+
             // 1. Update system stats first (often doesn't trigger Ollama if service is down, but GPUtil/psutil might)
             updateSystemStats();
 
             // 2. Wait a bit before checking Ollama state
             await new Promise(r => setTimeout(r, 500));
-
-            // 3. Load running models (This is the most likely to trigger Ollama service)
-            loadRunningModels();
 
             // 4. Wait again
             await new Promise(r => setTimeout(r, 500));
@@ -1528,7 +1550,6 @@
         }
 
         // Auto-refresh running models and downloads
-        setInterval(loadRunningModels, 5000);
         setInterval(loadAllDownloads, 1000);
         setInterval(updateSystemStats, 2000);  // Update system stats every 2 seconds
 
