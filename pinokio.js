@@ -1,4 +1,5 @@
 module.exports = {
+  version: "3.7",
   title: "Ollama Zimage prompt helper",
   description: "A web interface for managing and interacting with Ollama models",
   icon: "icon.png",
@@ -26,7 +27,7 @@ module.exports = {
             default: true,
             icon: "fa-solid fa-rocket",
             text: "Open Web UI",
-            href: local.url,
+            href: local.url + "?ts=" + Date.now(),
           }, {
             icon: "fa-solid fa-terminal",
             text: "Terminal",
@@ -59,7 +60,7 @@ module.exports = {
           default: true,
           icon: "fa-solid fa-power-off",
           text: "Start",
-          href: "start.js",
+          href: "start.js?ts=" + Date.now(),
         }, {
           icon: "fa-solid fa-plug",
           text: "Update",

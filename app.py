@@ -27,6 +27,9 @@ pull_progress = {}
 pull_threads = {}
 pull_processes = {}  # Store subprocess objects for cancellation
 
+# Lock for Ollama CLI commands to prevent concurrent launches on Windows
+ollama_lock = threading.Lock()
+
 OLLAMA_URL = "http://localhost:11434"
 
 # -----------------------------
@@ -145,31 +148,32 @@ Rules:
 
 def run_ollama_command(command):
     """Run an ollama command and return the output"""
-    try:
-        result = subprocess.run(
-            f"ollama {command}",
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        return {
-            "success": result.returncode == 0,
-            "output": result.stdout,
-            "error": result.stderr
-        }
-    except subprocess.TimeoutExpired:
-        return {
-            "success": False,
-            "output": "",
-            "error": "Command timed out"
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "output": "",
-            "error": str(e)
-        }
+    with ollama_lock:
+        try:
+            result = subprocess.run(
+                f"ollama {command}",
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            return {
+                "success": result.returncode == 0,
+                "output": result.stdout,
+                "error": result.stderr
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                "success": False,
+                "output": "",
+                "error": "Command timed out"
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "output": "",
+                "error": str(e)
+            }
 
 def parse_ps_output(output):
     """Parse the output of ollama ps command"""

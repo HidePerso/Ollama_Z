@@ -10,7 +10,7 @@ module.exports = {
         },
         message: "{{platform==='win32' ? '.\\\\venv\\\\Scripts\\\\python.exe' : './venv/bin/python'}} app.py",
         on: [{
-          "event": "/http:\\/\\/[a-zA-Z0-9.:]+/",
+          "event": "/(http:\\/\\/[0-9.:]+)/",
           "done": true
         }]
       }
@@ -18,7 +18,7 @@ module.exports = {
     {
       method: "local.set",
       params: {
-        url: "{{input.event[0]}}"
+        url: "{{input.event[1]}}"
       }
     }
   ]

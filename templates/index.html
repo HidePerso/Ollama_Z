@@ -978,7 +978,6 @@
                                     </div>
                                 </div>
                                 <div class="model-actions">
-                                    <button class="small success" onclick="runModel('${m.name}')">▶ Use in Pipeline</button>
                                     <button class="small" onclick="showModelInfo('${m.name}')">Info</button>
                                     <button class="small" onclick="copyModelPrompt('${m.name}')">Copy</button>
                                     <button class="small danger" onclick="removeModel('${m.name}')">Remove</button>
@@ -1217,15 +1216,6 @@
                         showNotification(data.error, 'error');
                     }
                 });
-        }
-
-        function runModel(modelName) {
-            autoSelectPipelineModels([modelName]);
-
-            // Scroll to pipeline section
-            document.querySelector('.card:nth-child(2)').scrollIntoView({ behavior: 'smooth', block: 'start' });
-
-            showNotification(`${modelName} applied to pipeline`);
         }
 
         function showModelInfo(modelName) {
@@ -1509,17 +1499,41 @@
         }
 
 
+        // Consolidate initialization to avoid concurrent Ollama CLI calls on startup
+        async function initApp() {
+            console.log("Initializing App...");
+
+            // 1. Update system stats first (often doesn't trigger Ollama if service is down, but GPUtil/psutil might)
+            updateSystemStats();
+
+            // 2. Wait a bit before checking Ollama state
+            await new Promise(r => setTimeout(r, 500));
+
+            // 3. Load running models (This is the most likely to trigger Ollama service)
+            loadRunningModels();
+
+            // 4. Wait again
+            await new Promise(r => setTimeout(r, 500));
+
+            // 5. Load available models (Shared with pipeline models)
+            loadAvailableModels();
+
+            // 6. Final wait
+            await new Promise(r => setTimeout(r, 500));
+
+            // 7. Load pipeline models (Uses same /api/list endpoint, but let's keep it separate for UI reasons)
+            loadPipelineModels();
+
+            loadAllDownloads();
+        }
+
         // Auto-refresh running models and downloads
         setInterval(loadRunningModels, 5000);
         setInterval(loadAllDownloads, 1000);
         setInterval(updateSystemStats, 2000);  // Update system stats every 2 seconds
 
-        console.log("PIPELINE CODE LOADED - v2");
-        loadRunningModels();
-        loadAvailableModels();
-        loadAllDownloads();
-        updateSystemStats();
-        loadPipelineModels();  // Load models for pipeline dropdowns
+        console.log("PIPELINE CODE LOADED - v3 (Sequential Init)");
+        initApp();
     </script>
 </body>
 
