@@ -1,0 +1,20 @@
+{
+  "Default": {
+    "translator": "translator",
+    "extractor": "extractor",
+    "structurer": "structurer",
+    "validator": "validator"
+  },
+  "ZImage Artist": {
+    "translator": "translator",
+    "extractor": "extractor",
+    "structurer": "Zimage (Visionary Artist)",
+    "validator": ""
+  },
+  "ZImage 2 stage": {
+    "translator": "translator",
+    "extractor": "extractor",
+    "structurer": "structurer",
+    "validator": ""
+  }
+}

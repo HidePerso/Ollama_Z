@@ -1,1 +1,7 @@
-{"translatorModel": "qwen3-translator:latest", "extractorModel": "qwen3-extractor:latest", "structurerModel": "qwen3-structurer:latest", "validatorModel": "qwen3-validator:latest"}
+{
+  "translatorModel": "qwen3-translator:latest",
+  "extractorModel": "qwen3-extractor:latest",
+  "structurerModel": "qwen3-structurer:latest",
+  "validatorModel": "qwen3-validator:latest",
+  "ui_theme": "Ocean"
+}
