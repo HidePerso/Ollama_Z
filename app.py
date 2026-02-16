@@ -1,6 +1,7 @@
 import gradio as gr
 import subprocess
 import json
+import html as html_lib
 import re
 from datetime import datetime
 import threading
@@ -9,6 +10,8 @@ import requests
 import signal
 import os
 import psutil
+import shlex
+import shutil
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -36,6 +39,10 @@ OLLAMA_URL = "http://localhost:11434"
 
 # Lock for Ollama CLI commands
 ollama_lock = threading.Lock()
+
+# Track active pull process for cancellation
+current_pull_process = None
+is_pull_cancelled = False
 
 # -----------------------------
 # Template Manager
@@ -214,6 +221,23 @@ def run_ollama_command(command):
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+def run_ollama_command_args(args, timeout=30):
+    with ollama_lock:
+        try:
+            result = subprocess.run(
+                ["ollama", *args],
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            return {
+                "success": result.returncode == 0,
+                "output": result.stdout,
+                "error": result.stderr
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
 def parse_list_output(output):
     lines = output.strip().split('\n')
     if len(lines) < 2:
@@ -368,6 +392,265 @@ CSS = """
 .model-item:last-child { border-bottom: none; }
 .model-name { font-weight: 600; color: var(--body-text-color); }
 .model-meta { font-size: 0.8em; color: gray; font-family: monospace; }
+.model-actions { margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; }
+.model-action-btn {
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  background: transparent;
+  border-radius: 8px;
+  height: 22px;
+  min-height: 22px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  font-size: 0.8em;
+  cursor: pointer;
+  pointer-events: auto;
+}
+.model-action-btn.delete {
+  border-color: rgba(220, 38, 38, 0.35);
+  color: #dc2626;
+}
+.model-action-proxy {
+  display: none !important;
+}
+.model-info-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+  z-index: 10000;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.model-info-modal-overlay.open {
+  display: flex;
+}
+.model-info-modal {
+  width: min(920px, 100%);
+  max-height: 85vh;
+  background: var(--body-background-fill, #fff);
+  color: var(--body-text-color, #111827);
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 12px;
+  box-shadow: 0 22px 48px rgba(15, 23, 42, 0.25);
+  display: flex;
+  flex-direction: column;
+}
+.model-info-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.25);
+}
+.model-info-modal-title {
+  margin: 0;
+  font-size: 1rem;
+}
+.model-info-modal-close {
+  border: 1px solid rgba(148, 163, 184, 0.45);
+  background: transparent;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.9rem;
+  padding: 4px 10px;
+}
+.model-info-modal-body {
+  margin: 0;
+  padding: 16px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.84rem;
+  line-height: 1.45;
+}
+
+"""
+
+ACTION_BUTTONS_JS = """
+<script>
+if (!window.handleInstalledModelAction) {
+  function queryWithShadow(root, selector) {
+    if (!root || !selector) return null;
+    if (typeof root.querySelector === 'function') {
+      var direct = root.querySelector(selector);
+      if (direct) return direct;
+    }
+    if (typeof root.querySelectorAll === 'function') {
+      var nodes = root.querySelectorAll('*');
+      for (var i = 0; i < nodes.length; i++) {
+        var shadow = nodes[i] && nodes[i].shadowRoot;
+        if (!shadow) continue;
+        var nested = queryWithShadow(shadow, selector);
+        if (nested) return nested;
+      }
+    }
+    return null;
+  }
+
+  function findInRoots(selector) {
+    var direct = queryWithShadow(document, selector);
+    if (direct) return direct;
+
+    var apps = document.querySelectorAll('gradio-app');
+    for (var i = 0; i < apps.length; i++) {
+      var root = apps[i] && apps[i].shadowRoot;
+      if (!root) continue;
+      var found = queryWithShadow(root, selector);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  function getActionButtonFromEvent(event) {
+    if (event && typeof event.composedPath === 'function') {
+      var path = event.composedPath();
+      for (var i = 0; i < path.length; i++) {
+        var node = path[i];
+        if (!node || !node.classList || !node.dataset) continue;
+        if (node.classList.contains('model-action-btn') && node.dataset.action && node.dataset.model) {
+          return node;
+        }
+      }
+    }
+    if (event && event.target && typeof event.target.closest === 'function') {
+      return event.target.closest('.model-action-btn[data-action][data-model]');
+    }
+    return null;
+  }
+
+  window.handleInstalledModelAction = function(action, model) {
+    var payloadInput = findInRoots('#model_action_payload textarea, #model_action_payload input');
+    var submitBtn = findInRoots('#model_action_submit button, button#model_action_submit, #model_action_submit');
+    if (!payloadInput || !submitBtn) return;
+
+    var payload = JSON.stringify({ action: action, model: model });
+    var proto = payloadInput.tagName === 'TEXTAREA'
+      ? window.HTMLTextAreaElement.prototype
+      : window.HTMLInputElement.prototype;
+    var descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+    var valueSetter = descriptor && descriptor.set ? descriptor.set : null;
+
+    if (valueSetter) {
+      valueSetter.call(payloadInput, payload);
+    } else {
+      payloadInput.value = payload;
+    }
+    payloadInput.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    payloadInput.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+    submitBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: true }));
+  };
+}
+
+if (!window.ensureModelInfoPopup) {
+  window.ensureModelInfoPopup = function() {
+    var existing = document.getElementById('model_info_popup_overlay');
+    if (existing) return existing;
+
+    var overlay = document.createElement('div');
+    overlay.id = 'model_info_popup_overlay';
+    overlay.className = 'model-info-modal-overlay';
+    overlay.innerHTML = [
+      '<div class="model-info-modal" role="dialog" aria-modal="true" aria-labelledby="model_info_popup_title">',
+      '  <div class="model-info-modal-header">',
+      '    <h3 id="model_info_popup_title" class="model-info-modal-title">Model Info</h3>',
+      '    <button type="button" class="model-info-modal-close" data-close-model-info-popup>Close</button>',
+      '  </div>',
+      '  <pre id="model_info_popup_body" class="model-info-modal-body"></pre>',
+      '</div>'
+    ].join('');
+
+    overlay.addEventListener('click', function(evt) {
+      if (evt.target === overlay) overlay.classList.remove('open');
+    });
+
+    document.addEventListener('keydown', function(evt) {
+      if (evt.key === 'Escape') overlay.classList.remove('open');
+    });
+
+    document.body.appendChild(overlay);
+    return overlay;
+  };
+
+  window.openModelInfoPopup = function(modelName, infoText) {
+    var overlay = window.ensureModelInfoPopup();
+    if (!overlay) return;
+    var titleNode = overlay.querySelector('#model_info_popup_title');
+    var bodyNode = overlay.querySelector('#model_info_popup_body');
+    var closeNode = overlay.querySelector('[data-close-model-info-popup]');
+    if (titleNode) titleNode.textContent = modelName ? ('Model Info: ' + modelName) : 'Model Info';
+    if (bodyNode) bodyNode.textContent = infoText || '(No output)';
+    if (closeNode && !closeNode.__boundClose) {
+      closeNode.addEventListener('click', function() {
+        overlay.classList.remove('open');
+      });
+      closeNode.__boundClose = true;
+    }
+    overlay.classList.add('open');
+  };
+}
+
+if (!window.__bindModelInfoPopupSource) {
+  window.__readModelInfoPopupPayload = function() {
+    var source = findInRoots('#model_info_output textarea, #model_info_output input');
+    if (!source) return "";
+
+    // Gradio may recreate this node after updates; rebind listeners when that happens.
+    if (window.__modelInfoPopupSourceNode !== source) {
+      window.__modelInfoPopupSourceNode = source;
+      if (!source.__modelInfoPopupBound) {
+        var onPayloadEvent = function() {
+          window.__checkModelInfoPopupPayload();
+        };
+        source.addEventListener('input', onPayloadEvent);
+        source.addEventListener('change', onPayloadEvent);
+        source.__modelInfoPopupBound = true;
+      }
+    }
+    return (source.value || source.textContent || '').trim();
+  };
+
+  window.__checkModelInfoPopupPayload = function() {
+    var raw = window.__readModelInfoPopupPayload();
+    if (!raw || raw === window.__lastModelInfoPopupPayload) return;
+    window.__lastModelInfoPopupPayload = raw;
+    try {
+      var payload = JSON.parse(raw);
+      window.openModelInfoPopup(payload.model || '', payload.info || '');
+    } catch (_err) {}
+  };
+}
+
+if (!window.__modelInfoPopupSourceWatchdog) {
+  window.__modelInfoPopupSourceWatchdog = window.setInterval(function() {
+    window.__checkModelInfoPopupPayload();
+  }, 350);
+}
+
+if (!window.__installedModelActionBound) {
+  document.addEventListener('click', function(event) {
+    var button = getActionButtonFromEvent(event);
+    if (!button) return;
+    event.preventDefault();
+    var action = button.dataset.action;
+    var model = button.dataset.model || '';
+    if (action === 'delete') {
+      var confirmed = window.confirm('Delete model "' + model + '" from Ollama?');
+      if (confirmed) {
+        window.handleInstalledModelAction('delete_confirmed', model);
+      }
+      return;
+    }
+    window.handleInstalledModelAction(action, model);
+  });
+  window.__installedModelActionBound = true;
+}
+</script>
 """
 
 def get_system_monitor_info():
@@ -474,53 +757,312 @@ def compile_process(text, preset_name, progress=gr.Progress()):
     except Exception as e:
         return f"Error: {str(e)}"
 
-def pull_model_handler(model_name, progress=gr.Progress()):
-    if not model_name: return "Please enter a model name"
+def parse_size(size_str):
     try:
-        model_name = re.sub(r'^ollama\s+(run|pull)\s+', '', model_name, flags=re.IGNORECASE)
+        size_str = size_str.upper()
+        # Find first number
+        match = re.search(r'([\d.]+)', size_str)
+        if not match: return 0.0
+        val = float(match.group(1))
+        
+        if 'GB' in size_str: return val * 1024
+        elif 'KB' in size_str: return val / 1024
+        return val # MB
+    except: return 0.0
+
+def pull_model_handler(model_name, progress=gr.Progress()):
+    global current_pull_process, is_pull_cancelled
+
+    def pull_ui_state(is_pulling, status_text=""):
+        return (
+            gr.update(visible=not is_pulling),
+            gr.update(visible=is_pulling),
+            gr.update(visible=not is_pulling),
+            gr.update(value=status_text)
+        )
+    
+    # 1. Update UI to show 'Cancel' button immediately
+    yield pull_ui_state(True, "Connecting to Ollama...")
+    
+    if not model_name: 
+        gr.Warning("Please enter a model name")
+        yield pull_ui_state(False, "Please enter a model name")
+        return
+
+    try:
+        is_pull_cancelled = False
+        model_name = re.sub(r'^ollama\s+(run|pull)\s+', '', model_name, flags=re.IGNORECASE).strip()
+        
+        # Diagnostic: Check if ollama exists
+        ollama_path = shutil.which("ollama")
+        print(f"DEBUG: 'ollama' executable path: {ollama_path}")
+        if not ollama_path:
+            err_msg = "Ollama executable not found in PATH. Please ensure Ollama is installed and accessible."
+            gr.Warning(err_msg)
+            yield pull_ui_state(False, f"Error: {err_msg}")
+            return
+
+        print(f"DEBUG: Starting pull for '{model_name}'")
+        progress(0, desc=f"Connecting to Ollama...")
+        yield pull_ui_state(True, f"Connecting to Ollama ({model_name})...")
+        
+        creationflags = 0
+        if os.name == 'nt':
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+            
         process = subprocess.Popen(
-            f"ollama pull {model_name}",
-            shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, encoding='utf-8', errors='replace'
+            ["ollama", "pull", model_name],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, encoding='utf-8', errors='replace',
+            creationflags=creationflags
         )
         
+        current_pull_process = process
+        time.sleep(0.5) # Give it a moment to start
+        
+        last_line = ""
         for line in iter(process.stdout.readline, ''):
+            if is_pull_cancelled:
+                break
+            
             line = line.strip()
             if not line: continue
+            last_line = line
             
-            # Extract percentage
+            print(f"OLLAMA: {line}")
+            
+            # Parse progress
+            pct = None
+            desc = line
+            
             pct_match = re.search(r'(\d+)%', line)
-            if pct_match:
-                pct = int(pct_match.group(1))
-                progress(pct/100, desc=f"Pulling {model_name}: {line}")
-            else:
-                progress(None, desc=line)
-                
+            size_match = re.search(r'([\d.]+\s*[KMG]B)\s*/\s*([\d.]+\s*[KMG]B)', line, re.IGNORECASE)
+            
+            if size_match:
+                done_mb = parse_size(size_match.group(1))
+                total_mb = parse_size(size_match.group(2))
+                if total_mb > 0:
+                    pct = done_mb / total_mb
+                    desc = f"Downloading: {size_match.group(1)} / {size_match.group(2)}"
+            elif pct_match:
+                pct = float(pct_match.group(1)) / 100
+            
+            progress(0 if pct is None else pct, desc=desc)
+            # Yield to keep UI state consistent
+            yield pull_ui_state(True, desc)
+
         process.wait()
-        return f"Successfully pulled {model_name}" if process.returncode == 0 else f"Failed: {model_name}"
+        print(f"DEBUG: Process exit code: {process.returncode}")
+        
+        if process.returncode == 0:
+            progress(1.0, desc="Download complete")
+            gr.Info(f"Successfully pulled {model_name}")
+            yield pull_ui_state(False, f"Successfully pulled {model_name}")
+        elif not is_pull_cancelled:
+            err_msg = last_line if last_line else f"Exit code: {process.returncode}"
+            gr.Warning(f"Failed to pull {model_name}: {err_msg}")
+            # Keep the error message on the progress bar for a moment
+            progress(1.0, desc=f"Error: {err_msg}")
+            yield pull_ui_state(False, f"Failed to pull {model_name}: {err_msg}")
+        else:
+            yield pull_ui_state(False, "Pull cancelled")
+        
     except Exception as e:
-        return str(e)
+        print(f"DEBUG EXCEPTION: {e}")
+        err_msg = f"Pull Error: {str(e)}"
+        gr.Warning(err_msg)
+        yield pull_ui_state(False, err_msg)
+    finally:
+        current_pull_process = None
+        is_pull_cancelled = False
+        print("DEBUG: Pull handler finished, resetting UI")
+        yield pull_ui_state(False)
+
+def cancel_pull_handler():
+    global current_pull_process, is_pull_cancelled
+    if current_pull_process:
+        is_pull_cancelled = True
+        try:
+            if os.name == 'nt':
+                # Send CTRL_BREAK to process group on Windows
+                current_pull_process.send_signal(signal.CTRL_BREAK_EVENT)
+                current_pull_process.terminate()
+            else:
+                current_pull_process.terminate()
+            gr.Info("Pull cancelled")
+        except Exception as e:
+            pass # Process might already be dead
+        current_pull_process = None
+        return (
+            gr.update(visible=True),
+            gr.update(visible=False),
+            gr.update(visible=True),
+            gr.update(value="Pull cancelled")
+        )
+    return (
+        gr.update(visible=True),
+        gr.update(visible=False),
+        gr.update(visible=True),
+        gr.update(value="")
+    )
 
 def get_models_html():
     res = run_ollama_command("list")
     if res["success"]:
         models = parse_list_output(res["output"])
-        if not models: return "<p>No models installed</p>"
-        html = '<div class="models-container">'
+        if not models:
+            return "<p>No models installed</p>"
+        models_html = '<div class="models-container">'
         for m in models:
-            html += f"""
+            safe_name = html_lib.escape(m["name"])
+            safe_id = html_lib.escape(m["id"])
+            safe_size = html_lib.escape(m["size"])
+            safe_model_attr = html_lib.escape(m["name"], quote=True)
+            models_html += f"""
             <div class="model-item">
-                <div class="model-name">{m['name']}</div>
-                <div class="model-meta">ID: {m['id']} | Size: {m['size']}</div>
+                <div class="model-name">{safe_name}</div>
+                <div class="model-meta">ID: {safe_id} | Size: {safe_size}</div>
+                <div class="model-actions">
+                    <button type="button" class="model-action-btn" data-action="info" data-model="{safe_model_attr}">Info</button>
+                    <button type="button" class="model-action-btn delete" data-action="delete" data-model="{safe_model_attr}">Delete</button>
+                </div>
             </div>
             """
-        html += '</div>'
-        return html
+        models_html += '</div>'
+        return models_html
     return "<p>Error loading models</p>"
+
+def refresh_models_panel():
+    return (
+        get_models_html(),
+        gr.update(value=""),
+        gr.update(value="", visible=True),
+        gr.update(value=""),
+        gr.update(value=""),
+        gr.update(visible=False),
+    )
+
+def handle_model_action(payload):
+    if not payload:
+        return (
+            get_models_html(),
+            gr.update(value="No model action provided."),
+            gr.update(value="", visible=True),
+            gr.update(value=""),
+            gr.update(value=""),
+            gr.update(visible=False),
+        )
+    try:
+        data = json.loads(payload)
+    except Exception:
+        return (
+            get_models_html(),
+            gr.update(value="Invalid model action payload."),
+            gr.update(value="", visible=True),
+            gr.update(value=""),
+            gr.update(value=""),
+            gr.update(visible=False),
+        )
+
+    action = data.get("action")
+    model_name = (data.get("model") or "").strip()
+    if not action or not model_name:
+        return (
+            get_models_html(),
+            gr.update(value="Missing action or model name."),
+            gr.update(value="", visible=True),
+            gr.update(value=""),
+            gr.update(value=""),
+            gr.update(visible=False),
+        )
+
+    if action == "info":
+        res = run_ollama_command_args(["show", model_name], timeout=60)
+        if res["success"]:
+            info_text = (res.get("output") or "").strip() or "(No output)"
+            info_payload = json.dumps({"model": model_name, "info": info_text}, ensure_ascii=False)
+            return (
+                get_models_html(),
+                gr.update(value=f"Loaded info for `{model_name}`"),
+                gr.update(value=info_payload, visible=True),
+                gr.update(value=""),
+                gr.update(value=""),
+                gr.update(visible=False),
+            )
+        err = (res.get("error") or "Unknown error").strip()
+        return (
+            get_models_html(),
+            gr.update(value=f"Failed to load info for `{model_name}`: `{err}`"),
+            gr.update(value="", visible=True),
+            gr.update(value=""),
+            gr.update(value=""),
+            gr.update(visible=False),
+        )
+
+    if action == "delete":
+        return (
+            get_models_html(),
+            gr.update(value=f"Delete requested for `{model_name}`. Confirm below."),
+            gr.update(value="", visible=True),
+            gr.update(value=model_name),
+            gr.update(value=f"Are you sure you want to delete `{model_name}` from Ollama?"),
+            gr.update(visible=True),
+        )
+
+    if action == "delete_confirmed":
+        return confirm_model_delete(model_name)
+
+    return (
+        get_models_html(),
+        gr.update(value=f"Unsupported action: `{action}`"),
+        gr.update(value="", visible=True),
+        gr.update(value=""),
+        gr.update(value=""),
+        gr.update(visible=False),
+    )
+
+def cancel_model_delete():
+    return (
+        gr.update(value="Delete canceled."),
+        gr.update(value=""),
+        gr.update(value=""),
+        gr.update(visible=False),
+    )
+
+def confirm_model_delete(model_name):
+    model_name = (model_name or "").strip()
+    if not model_name:
+        return (
+            get_models_html(),
+            gr.update(value="No model selected for deletion."),
+            gr.update(value="", visible=True),
+            gr.update(value=""),
+            gr.update(value=""),
+            gr.update(visible=False),
+        )
+    res = run_ollama_command_args(["rm", model_name], timeout=90)
+    if res["success"]:
+        return (
+            get_models_html(),
+            gr.update(value=f"Deleted model `{model_name}`"),
+            gr.update(value="", visible=True),
+            gr.update(value=""),
+            gr.update(value=""),
+            gr.update(visible=False),
+        )
+    err = (res.get("error") or "Unknown error").strip()
+    return (
+        get_models_html(),
+        gr.update(value=f"Failed to delete `{model_name}`: `{err}`"),
+        gr.update(value="", visible=True),
+        gr.update(value=""),
+        gr.update(value=""),
+        gr.update(visible=False),
+    )
 
 print("--- Building Gradio UI ---")
 
-with gr.Blocks(theme=get_theme_from_settings()) as demo:
+with gr.Blocks() as demo:
     
     with gr.Tabs() as main_tabs:
         with gr.Tab("📝 Prompt Helper"):
@@ -591,8 +1133,8 @@ with gr.Blocks(theme=get_theme_from_settings()) as demo:
             
             # pipeline_status removed
 
-        with gr.Tab("📦 Models"):
-            gr.Markdown("### Define Pipeline Models & Templates")
+        with gr.Tab("⚙️ Pipeline Models"):
+            gr.Markdown("### Define Pipeline Models")
             
             with gr.Row() as preset_select_row:
                 role_preset = gr.Dropdown(choices=template_manager.keys(), label="Role Preset", value="translator", allow_custom_value=True, scale=3)
@@ -612,18 +1154,51 @@ with gr.Blocks(theme=get_theme_from_settings()) as demo:
                     cancel_add_btn = gr.Button("❌ Cancel")
                 
             template_content = gr.TextArea(label="System Template", lines=10, value=template_manager.get("translator"))
-            save_template_btn = gr.Button("💾 Save Content", variant="primary")
+            with gr.Row():
+                save_template_btn = gr.Button("Save role preset", variant="primary", scale=1, min_width=90)
+                generate_model_btn = gr.Button("Generate Pipeline Model", scale=1, min_width=140)
+            generate_model_status = gr.Markdown("---")
 
-            gr.Markdown("---")
-            
-            with gr.Accordion("Installed Models", open=False):
+        with gr.Tab("🦙 Ollama models"):
+
+            with gr.Column():
                 with gr.Row():
-                    pull_name = gr.Textbox(label="Pull Model (ollama pull)", placeholder="e.g., llama3", scale=3)
-                    pull_btn = gr.Button("⬇️ Pull", scale=1)
+                    pull_name = gr.Textbox(
+                        label="Pull Model (ollama pull)",
+                        placeholder="Enter model name (e.g., llama2, mistral, qwen3:8b)",
+                        scale=3
+                    )
+                    pull_btn = gr.Button("⬇️ Pull", scale=1, min_width=120)
+                    cancel_pull_btn = gr.Button("❌ Cancel", scale=1, min_width=120, visible=False, variant="stop")
+                pull_help = gr.HTML("""
+                <div style="margin-top: 4px; margin-bottom: 8px; line-height: 1.5;">
+                    <p style="margin: 0 0 6px 0;">
+                        Enter an Ollama model name (for example: <code>llama2</code>, <code>mistral</code>, <code>qwen3:8b</code>) or a full pull/run command.
+                    </p>
+                    <a href="https://ollama.com/library" target="_blank" style="margin-right: 12px; text-decoration: none;">Ollama Library</a>
+                    <a href="https://huggingface.co/models?library=gguf&sort=trending" target="_blank" style="text-decoration: none;">GGUF Models</a>
+                </div>
+                """)
+                pull_status = gr.Markdown("---")
                 
-                pull_status = gr.Markdown("")
                 refresh_models_btn = gr.Button("🔄 Refresh List")
-                models_html = gr.HTML(get_models_html()) 
+                models_html = gr.HTML(get_models_html())
+                model_action_status = gr.Markdown("---")
+                model_info_output = gr.TextArea(
+                    label="Model Info",
+                    lines=12,
+                    interactive=False,
+                    visible=True,
+                    elem_id="model_info_output",
+                    elem_classes=["model-action-proxy"]
+                )
+                model_action_payload = gr.Textbox(visible=True, elem_id="model_action_payload", elem_classes=["model-action-proxy"])
+                model_action_submit = gr.Button("Model Action Trigger", visible=True, elem_id="model_action_submit", elem_classes=["model-action-proxy"])
+                model_delete_pending = gr.Textbox(visible=False)
+                with gr.Row(visible=False) as model_delete_confirm_row:
+                    model_delete_confirm_text = gr.Markdown("")
+                    confirm_model_delete_btn = gr.Button("✅ Confirm Delete", variant="stop")
+                    cancel_model_delete_btn = gr.Button("❌ Cancel")
 
         with gr.Tab("🛠️ App Settings"):
             all_themes = list(BUILTIN_THEMES.keys()) + list(COMMUNITY_THEMES.keys())
@@ -731,8 +1306,42 @@ with gr.Blocks(theme=get_theme_from_settings()) as demo:
     save_pipeline_preset_btn.click(save_current_pipeline_preset, [pipeline_preset, t_role, e_role, s_role, v_role], None)
     
     # Models Tab Events
-    refresh_models_btn.click(get_models_html, None, models_html)
-    pull_btn.click(pull_model_handler, pull_name, pull_status).then(get_models_html, None, models_html)
+    refresh_models_btn.click(
+        refresh_models_panel,
+        None,
+        [models_html, model_action_status, model_info_output, model_delete_pending, model_delete_confirm_text, model_delete_confirm_row]
+    )
+    model_action_submit.click(
+        handle_model_action,
+        model_action_payload,
+        [models_html, model_action_status, model_info_output, model_delete_pending, model_delete_confirm_text, model_delete_confirm_row]
+    )
+    
+    # Wired to handler that yields button updates
+    pull_event = pull_btn.click(
+        pull_model_handler,
+        pull_name,
+        [pull_btn, cancel_pull_btn, pull_help, pull_status],
+        show_progress="full"
+    )
+    # Refresh list after pull is done (generator finishes)
+    pull_event.then(
+        refresh_models_panel,
+        None,
+        [models_html, model_action_status, model_info_output, model_delete_pending, model_delete_confirm_text, model_delete_confirm_row]
+    )
+    
+    cancel_pull_btn.click(cancel_pull_handler, None, [pull_btn, cancel_pull_btn, pull_help, pull_status])
+    confirm_model_delete_btn.click(
+        confirm_model_delete,
+        model_delete_pending,
+        [models_html, model_action_status, model_info_output, model_delete_pending, model_delete_confirm_text, model_delete_confirm_row]
+    )
+    cancel_model_delete_btn.click(
+        cancel_model_delete,
+        None,
+        [model_action_status, model_delete_pending, model_delete_confirm_text, model_delete_confirm_row]
+    )
     
     def on_role_change(role):
         return template_manager.get(role)
@@ -785,16 +1394,145 @@ with gr.Blocks(theme=get_theme_from_settings()) as demo:
         if not role: return
         template_manager.set(role, content)
         gr.Info(f"Template for '{role}' saved!")
+
+    def generate_model(role, content, progress=gr.Progress()):
+        def generate_ui_state(is_generating, status_text=""):
+            return (
+                gr.update(interactive=not is_generating),
+                gr.update(value=status_text)
+            )
+
+        yield generate_ui_state(True, "Connecting to Ollama create API...")
+
+        if not role:
+            gr.Warning("Select a role preset first.")
+            yield generate_ui_state(False, "Select a role preset first.")
+            return
+        if not content or not content.strip():
+            gr.Warning("System template is empty.")
+            yield generate_ui_state(False, "System template is empty.")
+            return
+
+        # Persist editor content to preset, then always build from preset source.
+        template_manager.set(role, content)
+        preset_content = template_manager.get(role)
+        if not preset_content or not preset_content.strip():
+            gr.Warning(f"Preset '{role}' is empty.")
+            yield generate_ui_state(False, f"Preset '{role}' is empty.")
+            return
+
+        lines = preset_content.splitlines()
+        first_non_empty = next((ln.strip() for ln in lines if ln.strip()), "")
+        from_match = re.match(r"^FROM\s+([^\s#]+)", first_non_empty, flags=re.IGNORECASE)
+        if not from_match:
+            gr.Warning("First non-empty line must be `FROM <model>` (for example: `FROM qwen3:8b`).")
+            yield generate_ui_state(False, "First non-empty line must be `FROM <model>`.")
+            return
+
+        source_model = from_match.group(1).strip()
+        source_base = source_model.split("/")[-1].split(":", 1)[0]
+        safe_source_base = re.sub(r"[^a-zA-Z0-9._-]+", "-", source_base).strip("-").lower()
+        safe_role = re.sub(r"[^a-zA-Z0-9._-]+", "-", role.strip()).strip("-").lower()
+        if not safe_source_base:
+            gr.Warning("Could not derive base model name from the `FROM` line.")
+            yield generate_ui_state(False, "Could not derive base model name from the `FROM` line.")
+            return
+        if not safe_role:
+            safe_role = "role"
+
+        model_name = f"{safe_source_base}-{safe_role}"
+        modelfile_path = APP_DIR / f"Modelfile.{safe_role}"
+        modelfile_path.write_text(preset_content.rstrip() + "\n", encoding="utf-8")
+
+        progress(0, desc=f"Creating {model_name}...")
+        yield generate_ui_state(True, f"Creating `{model_name}`...")
+
+        try:
+            request_json = {
+                "name": model_name,
+                "from": source_model,
+                "modelfile": preset_content.rstrip() + "\n"
+            }
+
+            with ollama_lock:
+                with requests.post(
+                    f"{OLLAMA_URL}/api/create",
+                    json=request_json,
+                    stream=True,
+                    timeout=(10, 1800)
+                ) as response:
+                    response.raise_for_status()
+                    for raw_line in response.iter_lines(decode_unicode=True):
+                        if not raw_line:
+                            continue
+                        try:
+                            event = json.loads(raw_line)
+                        except Exception:
+                            continue
+
+                        if event.get("error"):
+                            raise RuntimeError(str(event["error"]))
+
+                        status = str(event.get("status") or "").strip() or "Creating model..."
+                        completed = event.get("completed")
+                        total = event.get("total")
+                        pct = None
+                        if isinstance(completed, (int, float)) and isinstance(total, (int, float)) and total > 0:
+                            pct = max(0.0, min(1.0, float(completed) / float(total)))
+                            status = f"{status} ({int(completed)}/{int(total)})"
+
+                        progress(0 if pct is None else pct, desc=status)
+                        last_status = status
+                        yield generate_ui_state(True, status)
+
+            progress(1.0, desc=f"Model {model_name} created")
+            gr.Info(f"Model '{model_name}' generated successfully from {modelfile_path.name}.")
+            yield generate_ui_state(False, f"Successfully generated `{model_name}`")
+            return
+
+        except requests.HTTPError as e:
+            err_text = ""
+            try:
+                resp = e.response
+                if resp is not None:
+                    try:
+                        err_json = resp.json()
+                        err_text = str(err_json.get("error") or err_json).strip()
+                    except Exception:
+                        err_text = (resp.text or "").strip()
+            except Exception:
+                err_text = ""
+            err = err_text or str(e).strip() or "Unknown error"
+            gr.Warning(f"Failed to generate model '{model_name}': {err}")
+            progress(1.0, desc=f"Error: {err}")
+            yield generate_ui_state(False, f"Failed to generate `{model_name}`: {err}")
+            return
+
+        except Exception as e:
+            err = str(e).strip() or "Unknown error"
+            gr.Warning(f"Failed to generate model '{model_name}': {err}")
+            progress(1.0, desc=f"Error: {err}")
+            yield generate_ui_state(False, f"Failed to generate `{model_name}`: {err}")
+            return
         
     save_template_btn.click(save_template, [role_preset, template_content], None)
+    generate_model_btn.click(
+        generate_model,
+        [role_preset, template_content],
+        [generate_model_btn, generate_model_status],
+        show_progress="full"
+    )
     
     copy_btn.click(fn=None, inputs=final_out, js="(x) => { navigator.clipboard.writeText(x); alert('Copied to clipboard!'); }")
     clear_btn.click(lambda: ["", ""], None, [input_text, final_out])
 
 if __name__ == "__main__":
     print("--- Launching Demo on Port 11436 ---")
+    demo.queue()
     demo.launch(
         server_name="127.0.0.1", 
         server_port=11436, 
-        css=CSS
+        css=CSS,
+        theme=get_theme_from_settings(),
+        head=ACTION_BUTTONS_JS
     )

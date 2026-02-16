@@ -3,5 +3,5 @@
   "extractorModel": "qwen3-extractor:latest",
   "structurerModel": "qwen3-structurer:latest",
   "validatorModel": "qwen3-validator:latest",
-  "ui_theme": "Ocean"
+  "ui_theme": "Glass"
 }

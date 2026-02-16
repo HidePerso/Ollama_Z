@@ -16,5 +16,11 @@
     "extractor": "extractor",
     "structurer": "structurer",
     "validator": ""
+  },
+  "FLUX": {
+    "translator": "translator",
+    "extractor": "extractor",
+    "structurer": "structurer FLUX",
+    "validator": ""
   }
 }
