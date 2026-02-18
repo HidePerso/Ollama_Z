@@ -21,6 +21,12 @@
     "translator": "translator",
     "extractor": "extractor",
     "structurer": "structurer FLUX",
+    "validator": "Guard validator"
+  },
+  "SDXL": {
+    "translator": "translator",
+    "extractor": "extractor",
+    "structurer": "structurer",
     "validator": ""
   }
 }

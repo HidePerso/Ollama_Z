@@ -313,12 +313,20 @@ def has_cyrillic(text: str) -> bool:
     letter_count = len(re.findall(r'[\w]', text, re.UNICODE))
     return (cyrillic_count / letter_count > 0.3) if letter_count > 0 else False
 
-def ollama_generate_sync(model: str, prompt: str, temperature: float = 0.1) -> str:
+def ollama_generate_sync(model: str, prompt: str, temperature: Optional[float] = 0.1) -> str:
     try:
-        response = requests.post(f"{OLLAMA_URL}/api/generate", json={
-            "model": model, "prompt": prompt, "stream": False,
-            "options": {"temperature": temperature, "num_ctx": 4096}
-        }, timeout=300)
+        request_json = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+        }
+        if temperature is not None:
+            request_json["options"] = {"temperature": temperature, "num_ctx": 4096}
+        response = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json=request_json,
+            timeout=300
+        )
         response.raise_for_status()
         return response.json().get('response', '').strip()
     except Exception as e:
@@ -682,9 +690,36 @@ def get_default_model(models, keyword, saved_val=None):
             return m
     return None
 
+def extract_temperature_from_description(content: str) -> Optional[float]:
+    if not content:
+        return None
+    patterns = [
+        r'^\s*PARAMETER\s+temperature\s+([+-]?\d+(?:[.,]\d+)?)\b',
+        r'\btemperature\s*[:=]\s*([+-]?\d+(?:[.,]\d+)?)\b',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, content, re.IGNORECASE | re.MULTILINE)
+        if not match:
+            continue
+        try:
+            return float(match.group(1).replace(",", "."))
+        except Exception:
+            continue
+    return None
+
+def build_generated_model_name(source_model: str, role: str) -> str:
+    source_base = source_model.split("/")[-1].split(":", 1)[0]
+    safe_source_base = re.sub(r"[^a-zA-Z0-9._-]+", "-", source_base).strip("-").lower()
+    safe_role = re.sub(r"[^a-zA-Z0-9._-]+", "-", (role or "").strip()).strip("-").lower()
+    if not safe_source_base:
+        safe_source_base = "model"
+    if not safe_role:
+        safe_role = "role"
+    return f"{safe_source_base}-{safe_role}"
+
 def parse_role_config(role_key):
     if not role_key or role_key == UNDEFINED_ROLE:
-        return None, None
+        return None, None, None, False
         
     content = template_manager.get(role_key)
     if not content:
@@ -693,7 +728,9 @@ def parse_role_config(role_key):
     
     # Simple parsing of Modelfile-like content
     model_match = re.search(r'^FROM\s+([^\s]+)', content, re.MULTILINE | re.IGNORECASE)
-    model = model_match.group(1) if model_match else "qwen2.5:latest" # Default fallback
+    source_model = model_match.group(1).strip() if model_match else None
+    use_role_model = bool(source_model)
+    model = build_generated_model_name(source_model, role_key) if use_role_model else "qwen2.5:latest"
     
     # Extract System Prompt
     system_match = re.search(r'SYSTEM\s+"""(.*?)"""', content, re.DOTALL | re.IGNORECASE)
@@ -701,9 +738,10 @@ def parse_role_config(role_key):
         system_match = re.search(r'SYSTEM\s+(.*)', content, re.IGNORECASE)
         
     system = system_match.group(1).strip() if system_match else content
+    temperature = extract_temperature_from_description(content)
     
     # Clean system prompt (remove potential escape issues if needed)
-    return model, system
+    return model, system, temperature, use_role_model
 
 def compile_process(text, preset_name, progress=gr.Progress()):
     if not text: return "Error: Input text required", "", ""
@@ -719,38 +757,42 @@ def compile_process(text, preset_name, progress=gr.Progress()):
         vali_role = preset.get("validator")
 
         # Stage 0: Translator
-        t_model, t_sys = parse_role_config(trans_role)
+        t_model, t_sys, t_temp, t_use_role_model = parse_role_config(trans_role)
         if has_cyrillic(text):
             if not t_model: return "Error: Translator required for Cyrillic (role undefined)", "", ""
             
         if t_model:
             progress(0.2, desc=f"Translating via {trans_role} ({t_model})...")
-            input_en = ollama_generate_sync(t_model, f"{t_sys}\n\nUSER TEXT:\n{text}", 0.05)
+            translator_prompt = text if t_use_role_model else f"{t_sys}\n\nUSER TEXT:\n{text}"
+            translator_temp = None if t_use_role_model else (t_temp if t_temp is not None else 0.05)
+            input_en = ollama_generate_sync(t_model, translator_prompt, translator_temp)
         else:
             # If no translator, use original text as input_en (already set)
             pass
         
         # Stage 1: Extractor
-        e_model, e_sys = parse_role_config(extr_role)
+        e_model, e_sys, e_temp, e_use_role_model = parse_role_config(extr_role)
         if not e_model: return "Error: Extractor role undefined", "", ""
         progress(0.4, desc=f"Extracting facts via {extr_role} ({e_model})...")
-        facts = normalize_facts(ollama_generate_sync(e_model, f"{e_sys}\n\nINPUT:\n{input_en}", 0.1))
+        extractor_prompt = input_en if e_use_role_model else f"{e_sys}\n\nINPUT:\n{input_en}"
+        extractor_temp = None if e_use_role_model else (e_temp if e_temp is not None else 0.1)
+        facts = normalize_facts(ollama_generate_sync(e_model, extractor_prompt, extractor_temp))
         
         # Stage 2: Structurer
-        s_model, s_sys = parse_role_config(stru_role)
+        s_model, s_sys, s_temp, s_use_role_model = parse_role_config(stru_role)
         if not s_model: return "Error: Structurer role undefined", "", ""
         progress(0.7, desc=f"Structuring via {stru_role} ({s_model})...")
-        stru_p = (f"{s_sys}\n\nDESCRIPTION:\n{input_en}\n\nFACTS:\n{facts}\n\nOUTPUT:")
-        structured = ollama_generate_sync(s_model, stru_p, 0.15)
+        stru_p = input_en if s_use_role_model else f"{s_sys}\n\nDESCRIPTION:\n{input_en}\n\nFACTS:\n{facts}\n\nOUTPUT:"
+        stru_temp = None if s_use_role_model else (s_temp if s_temp is not None else 0.15)
+        structured = ollama_generate_sync(s_model, stru_p, stru_temp)
         
         # Stage 3: Validator (Optional)
-        v_model, v_sys = parse_role_config(vali_role)
-        # Stage 3: Validator (Optional)
-        v_model, v_sys = parse_role_config(vali_role)
+        v_model, v_sys, v_temp, v_use_role_model = parse_role_config(vali_role)
         if v_model:
             progress(0.9, desc=f"Validating via {vali_role} ({v_model})...")
-            vali_p = f"{v_sys}\n\nORIGINAL:\n{input_en}\n\nFACTS:\n{facts}\n\nCANDIDATE:\n{structured}\n\nFIXED:"
-            structured = ollama_generate_sync(v_model, vali_p, 0.1)
+            vali_p = structured if v_use_role_model else f"{v_sys}\n\nORIGINAL:\n{input_en}\n\nFACTS:\n{facts}\n\nCANDIDATE:\n{structured}\n\nFIXED:"
+            vali_temp = None if v_use_role_model else (v_temp if v_temp is not None else 0.1)
+            structured = ollama_generate_sync(v_model, vali_p, vali_temp)
             
         progress(1.0, desc="Complete!")
         return structured
@@ -1430,19 +1472,8 @@ with gr.Blocks() as demo:
             return
 
         source_model = from_match.group(1).strip()
-        source_base = source_model.split("/")[-1].split(":", 1)[0]
-        safe_source_base = re.sub(r"[^a-zA-Z0-9._-]+", "-", source_base).strip("-").lower()
-        safe_role = re.sub(r"[^a-zA-Z0-9._-]+", "-", role.strip()).strip("-").lower()
-        if not safe_source_base:
-            gr.Warning("Could not derive base model name from the `FROM` line.")
-            yield generate_ui_state(False, "Could not derive base model name from the `FROM` line.")
-            return
-        if not safe_role:
-            safe_role = "role"
-
-        model_name = f"{safe_source_base}-{safe_role}"
-        modelfile_path = APP_DIR / f"Modelfile.{safe_role}"
-        modelfile_path.write_text(preset_content.rstrip() + "\n", encoding="utf-8")
+        model_name = build_generated_model_name(source_model, role)
+        modelfile_content = preset_content.rstrip() + "\n"
 
         progress(0, desc=f"Creating {model_name}...")
         yield generate_ui_state(True, f"Creating `{model_name}`...")
@@ -1451,7 +1482,7 @@ with gr.Blocks() as demo:
             request_json = {
                 "name": model_name,
                 "from": source_model,
-                "modelfile": preset_content.rstrip() + "\n"
+                "modelfile": modelfile_content
             }
 
             with ollama_lock:
@@ -1486,7 +1517,7 @@ with gr.Blocks() as demo:
                         yield generate_ui_state(True, status)
 
             progress(1.0, desc=f"Model {model_name} created")
-            gr.Info(f"Model '{model_name}' generated successfully from {modelfile_path.name}.")
+            gr.Info(f"Model '{model_name}' generated successfully.")
             yield generate_ui_state(False, f"Successfully generated `{model_name}`")
             return
 
