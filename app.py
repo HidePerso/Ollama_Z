@@ -782,7 +782,10 @@ def compile_process(text, preset_name, progress=gr.Progress()):
         s_model, s_sys, s_temp, s_use_role_model = parse_role_config(stru_role)
         if not s_model: return "Error: Structurer role undefined", "", ""
         progress(0.7, desc=f"Structuring via {stru_role} ({s_model})...")
-        stru_p = input_en if s_use_role_model else f"{s_sys}\n\nDESCRIPTION:\n{input_en}\n\nFACTS:\n{facts}\n\nOUTPUT:"
+        if s_use_role_model:
+            stru_p = f"DESCRIPTION:\n{input_en}\n\nFACTS:\n{facts}\n\nOUTPUT:"
+        else:
+            stru_p = f"{s_sys}\n\nDESCRIPTION:\n{input_en}\n\nFACTS:\n{facts}\n\nOUTPUT:"
         stru_temp = None if s_use_role_model else (s_temp if s_temp is not None else 0.15)
         structured = ollama_generate_sync(s_model, stru_p, stru_temp)
         
@@ -790,7 +793,10 @@ def compile_process(text, preset_name, progress=gr.Progress()):
         v_model, v_sys, v_temp, v_use_role_model = parse_role_config(vali_role)
         if v_model:
             progress(0.9, desc=f"Validating via {vali_role} ({v_model})...")
-            vali_p = structured if v_use_role_model else f"{v_sys}\n\nORIGINAL:\n{input_en}\n\nFACTS:\n{facts}\n\nCANDIDATE:\n{structured}\n\nFIXED:"
+            if v_use_role_model:
+                vali_p = f"FACTS:\n{facts}\n\nCANDIDATE:\n{structured}\n\nFIXED:"
+            else:
+                vali_p = f"{v_sys}\n\nFACTS:\n{facts}\n\nCANDIDATE:\n{structured}\n\nFIXED:"
             vali_temp = None if v_use_role_model else (v_temp if v_temp is not None else 0.1)
             structured = ollama_generate_sync(v_model, vali_p, vali_temp)
             
