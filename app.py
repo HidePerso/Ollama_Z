@@ -389,6 +389,14 @@ def extract_png_metadata(image_path: str) -> dict:
         "error": None,
     }
 
+    def _clean_resource_name(value: Any) -> str:
+        text = str(value or "").strip().replace("\\", "/")
+        if not text:
+            return ""
+        base = os.path.basename(text)
+        stem, _ = os.path.splitext(base)
+        return stem or base
+
     def _to_text(value: Any) -> str:
         if value is None:
             return ""
@@ -425,6 +433,60 @@ def extract_png_metadata(image_path: str) -> dict:
             text = text[8:]
         return text
 
+    def _looks_like_prompt_json(text: str) -> bool:
+        sample = (text or "").strip()
+        if not sample:
+            return False
+        hint_tokens = (
+            '"prompt"', '"positive"', '"negative"', '"negative_prompt"', '"negativeprompt"',
+            '"sui_image_params"', '"sui_models"', '"class_type"', '"sampler"', '"steps"', '"seed"',
+        )
+        return any(token in sample for token in hint_tokens)
+
+    def _extract_json_substrings(text: str):
+        sample = text or ""
+        if not sample:
+            return
+        stack = []
+        start = None
+        in_string = False
+        escape = False
+        for idx, ch in enumerate(sample):
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+                continue
+            if ch in "{[":
+                if not stack:
+                    start = idx
+                stack.append("}" if ch == "{" else "]")
+            elif ch in "}]":
+                if not stack or ch != stack[-1]:
+                    stack = []
+                    start = None
+                    continue
+                stack.pop()
+                if not stack and start is not None:
+                    candidate = sample[start:idx + 1].strip()
+                    if len(candidate) >= 16 and _looks_like_prompt_json(candidate):
+                        yield candidate
+                    start = None
+
+    def _try_parse_json_candidates(text: str) -> bool:
+        parsed = False
+        for candidate in _extract_json_substrings(text):
+            parsed = _fill_from_comfy_prompt(candidate) or parsed
+            if result["prompt_text"] and result["params"]:
+                break
+        return parsed
+
     def _fill_from_generic_json(data: Any) -> bool:
         found = False
 
@@ -440,6 +502,73 @@ def extract_png_metadata(image_path: str) -> dict:
                 found = True
 
         if isinstance(data, dict):
+            sui_params = data.get("sui_image_params")
+            if isinstance(sui_params, dict):
+                _set_if_longer("prompt_text", sui_params.get("prompt"))
+                _set_if_longer("negative_prompt", sui_params.get("negativeprompt"))
+                _set_if_longer("negative_prompt", sui_params.get("negative_prompt"))
+                swarm_key_map = {
+                    "steps": "steps",
+                    "cfgscale": "cfg",
+                    "cfg_scale": "cfg",
+                    "sampler": "sampler",
+                    "scheduler": "scheduler",
+                    "seed": "seed",
+                    "width": "width",
+                    "height": "height",
+                    "model": "model",
+                    "vae": "vae",
+                    "clipstopatlayer": "clip_skip",
+                    "refinercontrolpercentage": "denoise",
+                    "refinermodel": "hires_checkpoint",
+                    "refinervae": "hires_vae",
+                    "refinersteps": "hires_steps",
+                    "refinercfgscale": "hires_cfg",
+                    "refinersampler": "hires_sampler",
+                    "refinerscheduler": "hires_scheduler",
+                    "refinerupscale": "hires_upscale",
+                    "refinerupscalemethod": "hires_upscaler",
+                    "swarm_version": "version",
+                }
+                for src_key, dst_key in swarm_key_map.items():
+                    if src_key in sui_params and sui_params.get(src_key) not in (None, ""):
+                        result["params"][dst_key] = sui_params.get(src_key)
+                        found = True
+
+            sui_models = data.get("sui_models")
+            if isinstance(sui_models, list):
+                hash_chunks = []
+                for item in sui_models:
+                    if not isinstance(item, dict):
+                        continue
+                    param_name = str(item.get("param") or "").strip()
+                    model_name = item.get("name")
+                    model_hash = item.get("hash")
+                    if param_name == "model" and model_name:
+                        result["params"]["model"] = model_name
+                        found = True
+                    elif param_name == "vae" and model_name:
+                        result["params"]["vae"] = model_name
+                        found = True
+                    elif param_name == "refinermodel" and model_name:
+                        result["params"]["hires_checkpoint"] = model_name
+                        found = True
+                    elif param_name == "refinervae" and model_name:
+                        result["params"]["hires_vae"] = model_name
+                        found = True
+                    if model_hash:
+                        label = param_name or _clean_resource_name(model_name) or "model"
+                        hash_chunks.append(f"{label}: {model_hash}")
+                        if param_name == "model":
+                            result["params"]["model_hash"] = model_hash
+                            found = True
+                        elif param_name == "vae":
+                            result["params"]["vae_hash"] = model_hash
+                            found = True
+                if hash_chunks:
+                    result["params"]["hashes"] = ", ".join(hash_chunks)
+                    found = True
+
             _set_if_longer("prompt_text", data.get("prompt"))
             _set_if_longer("prompt_text", data.get("positive"))
             _set_if_longer("prompt_text", data.get("positive_prompt"))
@@ -464,6 +593,7 @@ def extract_png_metadata(image_path: str) -> dict:
                 "vae": "vae",
                 "vae_hash": "vae_hash",
                 "version": "version",
+                "civitai_resources": "civitai_resources",
             }
             for src_key, dst_key in key_map.items():
                 if src_key in data and data.get(src_key) not in (None, ""):
@@ -504,11 +634,64 @@ def extract_png_metadata(image_path: str) -> dict:
             return _fill_from_generic_json(prompt_data)
 
         found = False
+        lora_resources = []
+
+        def _get_prompt_node(node_ref: Any) -> Optional[dict]:
+            if not isinstance(node_ref, (list, tuple)) or not node_ref:
+                return None
+            node_key = str(node_ref[0])
+            node = prompt_data.get(node_key)
+            return node if isinstance(node, dict) else None
+
+        def _resolve_prompt_ref(node_ref: Any) -> Any:
+            node = _get_prompt_node(node_ref)
+            if not node:
+                return node_ref
+            output_index = node_ref[1] if isinstance(node_ref, (list, tuple)) and len(node_ref) > 1 else 0
+            inputs = node.get("inputs", {})
+            if not isinstance(inputs, dict):
+                return node_ref
+            class_type_l = str(node.get("class_type", "")).lower()
+            if "mxslider2d" in class_type_l:
+                if output_index == 0:
+                    return inputs.get("Xi", inputs.get("Xf"))
+                if output_index == 1:
+                    return inputs.get("Yi", inputs.get("Yf"))
+            if output_index == 0:
+                for key in ("width", "value", "Xi", "Xf"):
+                    if key in inputs and inputs.get(key) not in (None, ""):
+                        return inputs.get(key)
+            if output_index == 1:
+                for key in ("height", "value", "Yi", "Yf"):
+                    if key in inputs and inputs.get(key) not in (None, ""):
+                        return inputs.get(key)
+            return node_ref
+
+        def _remember_lora(name_value: Any, weight_value: Any):
+            nonlocal found
+            clean_name = _clean_resource_name(name_value)
+            if not clean_name:
+                return
+            weight = weight_value if weight_value not in (None, "") else 1
+            try:
+                weight = float(weight)
+            except Exception:
+                pass
+            entry = {
+                "type": "lora",
+                "weight": weight,
+                "modelName": clean_name,
+            }
+            if entry not in lora_resources:
+                lora_resources.append(entry)
+                found = True
+
         for _, node_data in prompt_data.items():
             if not isinstance(node_data, dict):
                 continue
             inputs = node_data.get("inputs", {})
             class_type = str(node_data.get("class_type", ""))
+            class_type_l = class_type.lower()
 
             if isinstance(inputs, dict):
                 for text_key in ("text", "prompt", "positive", "positive_prompt", "clip_l", "t5xxl"):
@@ -522,7 +705,7 @@ def extract_png_metadata(image_path: str) -> dict:
                         result["negative_prompt"] = text_val
                         found = True
 
-                if "KSampler" in class_type or "sampler" in class_type.lower():
+                if "ksampler" in class_type_l or "sampler" in class_type_l:
                     if "seed" in inputs:
                         result["params"]["seed"] = inputs["seed"]
                     if "steps" in inputs:
@@ -534,16 +717,31 @@ def extract_png_metadata(image_path: str) -> dict:
                     if "scheduler" in inputs:
                         result["params"]["scheduler"] = inputs["scheduler"]
                 if "width" in inputs and "height" in inputs:
-                    result["params"]["width"] = inputs["width"]
-                    result["params"]["height"] = inputs["height"]
-                if "VAELoader" in class_type and "vae_name" in inputs:
+                    result["params"]["width"] = _resolve_prompt_ref(inputs["width"])
+                    result["params"]["height"] = _resolve_prompt_ref(inputs["height"])
+                if "vaeloader" in class_type_l and "vae_name" in inputs:
                     result["params"]["vae"] = inputs["vae_name"]
-                if "CheckpointLoader" in class_type and "ckpt_name" in inputs:
+                if "checkpointloader" in class_type_l and "ckpt_name" in inputs:
                     result["params"]["model"] = inputs["ckpt_name"]
-                if "UNETLoader" in class_type and "unet_name" in inputs:
+                if "unetloader" in class_type_l and "unet_name" in inputs:
                     result["params"]["model"] = inputs["unet_name"]
-                if "ModelSamplingSD3" in class_type and "model" in inputs and not result["params"].get("model"):
+                if "loraloader" in class_type_l and "lora_name" in inputs:
+                    weight = inputs.get("strength_model")
+                    if weight in (None, ""):
+                        weight = inputs.get("strength_clip")
+                    _remember_lora(inputs.get("lora_name"), weight)
+                if "power lora loader" in class_type_l:
+                    for key, value in inputs.items():
+                        if not str(key).lower().startswith("lora_") or not isinstance(value, dict):
+                            continue
+                        if not value.get("on"):
+                            continue
+                        _remember_lora(value.get("lora"), value.get("strength"))
+                if "modelsamplingsd3" in class_type_l and "model" in inputs and not result["params"].get("model"):
                     result["params"]["model"] = inputs["model"]
+
+        if lora_resources:
+            result["params"]["civitai_resources"] = lora_resources
 
         if not found and not result["params"]:
             return _fill_from_generic_json(prompt_data)
@@ -552,6 +750,8 @@ def extract_png_metadata(image_path: str) -> dict:
     def _fill_from_a1111_parameters(raw_text: str) -> bool:
         text = (raw_text or "").strip()
         if not text:
+            return False
+        if text.startswith("{") or text.startswith("["):
             return False
 
         found = False
@@ -594,6 +794,34 @@ def extract_png_metadata(image_path: str) -> dict:
             kv_line = text.splitlines()[-1]
 
         if kv_line:
+            civitai_match = re.search(r"Civitai resources\s*:\s*(\[[\s\S]*\])\s*$", kv_line, flags=re.IGNORECASE)
+            if civitai_match:
+                civitai_raw = civitai_match.group(1).strip()
+                if civitai_raw:
+                    try:
+                        result["params"]["civitai_resources"] = json.loads(civitai_raw)
+                    except Exception:
+                        result["params"]["civitai_resources"] = civitai_raw
+                    found = True
+                kv_line = kv_line[:civitai_match.start()].rstrip().rstrip(",").strip()
+            hashes_match = re.search(
+                r"Hashes\s*:\s*(.+?)(?=,\s+(?:ENSD|Face restoration|Postprocess upscaler|Postprocess upscale by|Hires upscaler|Hires steps|Hires upscale|Hires checkpoint|Hires VAE|Hires CFG scale|Hires sampler|Hires scheduler|RNG|Version|Civitai resources)\s*:|$)",
+                kv_line,
+                flags=re.IGNORECASE,
+            )
+            if hashes_match:
+                hashes_raw = hashes_match.group(1).strip()
+                if hashes_raw:
+                    result["params"]["hashes"] = hashes_raw
+                    found = True
+                    for hash_chunk in [c.strip() for c in hashes_raw.split(",") if c.strip() and ":" in c]:
+                        hash_key, hash_val = [p.strip() for p in hash_chunk.split(":", 1)]
+                        hash_key_l = hash_key.lower()
+                        if hash_key_l == "model" and hash_val:
+                            result["params"]["model_hash"] = hash_val
+                        elif hash_key_l == "vae" and hash_val:
+                            result["params"]["vae_hash"] = hash_val
+                kv_line = (kv_line[:hashes_match.start()] + kv_line[hashes_match.end():]).strip().strip(",").strip()
             for chunk in [c.strip() for c in kv_line.split(",") if c.strip()]:
                 if ":" not in chunk:
                     continue
@@ -659,6 +887,21 @@ def extract_png_metadata(image_path: str) -> dict:
                 elif key_l == "hires steps":
                     result["params"]["hires_steps"] = val
                     found = True
+                elif key_l == "hires checkpoint":
+                    result["params"]["hires_checkpoint"] = val
+                    found = True
+                elif key_l == "hires vae":
+                    result["params"]["hires_vae"] = val
+                    found = True
+                elif key_l == "hires cfg scale":
+                    result["params"]["hires_cfg"] = val
+                    found = True
+                elif key_l == "hires sampler":
+                    result["params"]["hires_sampler"] = val
+                    found = True
+                elif key_l == "hires scheduler":
+                    result["params"]["hires_scheduler"] = val
+                    found = True
                 elif key_l == "rng":
                     result["params"]["rng"] = val
                     found = True
@@ -697,6 +940,8 @@ def extract_png_metadata(image_path: str) -> dict:
                     continue
                 parsed_any = _fill_from_comfy_prompt(raw_val) or parsed_any
                 parsed_any = _fill_from_a1111_parameters(raw_val) or parsed_any
+                if not (result["prompt_text"] and result["params"]):
+                    parsed_any = _try_parse_json_candidates(raw_val) or parsed_any
                 if result["prompt_text"] and result["params"]:
                     break
 
@@ -714,6 +959,8 @@ def extract_png_metadata(image_path: str) -> dict:
                             continue
                         parsed_any = _fill_from_comfy_prompt(raw_exif) or parsed_any
                         parsed_any = _fill_from_a1111_parameters(raw_exif) or parsed_any
+                        if not (result["prompt_text"] and result["params"]):
+                            parsed_any = _try_parse_json_candidates(raw_exif) or parsed_any
                     try:
                         nested_exif = exif.get_ifd(Base.ExifOffset)
                     except Exception:
@@ -725,11 +972,31 @@ def extract_png_metadata(image_path: str) -> dict:
                                 continue
                             parsed_any = _fill_from_comfy_prompt(raw_nested) or parsed_any
                             parsed_any = _fill_from_a1111_parameters(raw_nested) or parsed_any
+                            if not (result["prompt_text"] and result["params"]):
+                                parsed_any = _try_parse_json_candidates(raw_nested) or parsed_any
+
+            if not (result["prompt_text"] and result["params"]):
+                raw_bytes = b""
+                try:
+                    raw_bytes = Path(image_path).read_bytes()
+                except Exception:
+                    raw_bytes = b""
+                if raw_bytes:
+                    for enc in ("utf-8", "utf-16le", "utf-16be", "latin-1"):
+                        try:
+                            decoded = raw_bytes.decode(enc, errors="ignore")
+                        except Exception:
+                            continue
+                        if not _looks_like_prompt_json(decoded):
+                            continue
+                        parsed_any = _try_parse_json_candidates(decoded) or parsed_any
+                        if result["prompt_text"] and result["params"]:
+                            break
 
             if not result["prompt_text"]:
                 for key in ("prompt", "Prompt", "Description", "description"):
                     val = (text_meta.get(key) or "").strip()
-                    if val and not val.startswith("{"):
+                    if val and not val.startswith("{") and not val.startswith("["):
                         result["prompt_text"] = val
                         parsed_any = True
                         break
@@ -818,8 +1085,18 @@ def build_civitai_parameters_text(metadata: dict) -> str:
     add_pair("Hires upscaler", params.get("hires_upscaler"))
     add_pair("Hires steps", params.get("hires_steps"))
     add_pair("Hires upscale", params.get("hires_upscale"))
+    add_pair("Hires checkpoint", params.get("hires_checkpoint"))
+    add_pair("Hires VAE", params.get("hires_vae"))
+    add_pair("Hires CFG scale", params.get("hires_cfg"))
+    add_pair("Hires sampler", params.get("hires_sampler"))
+    add_pair("Hires scheduler", params.get("hires_scheduler"))
     add_pair("RNG", params.get("rng"))
     add_pair("Version", params.get("version"))
+    civitai_resources = params.get("civitai_resources")
+    if civitai_resources:
+        if not isinstance(civitai_resources, str):
+            civitai_resources = json.dumps(civitai_resources, ensure_ascii=False, separators=(",", ":"))
+        add_pair("Civitai resources", civitai_resources)
 
     if kv_parts:
         lines.append(", ".join(kv_parts))
