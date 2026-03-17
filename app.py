@@ -14,9 +14,9 @@ import os
 import psutil
 import shlex
 import shutil
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
-import tempfile
 
 # Try to import GPUtil for GPU monitoring
 try:
@@ -36,6 +36,7 @@ except ImportError:
 # Configuration & Constants
 # -----------------------------
 APP_DIR = Path(__file__).parent
+FIXED_META_DIR = APP_DIR / "fixed_meta_exports"
 SETTINGS_FILE = APP_DIR / "pipeline_settings.json"
 PIPELINE_PRESETS_FILE = APP_DIR / "pipeline_presets.json"
 VLM_PRESETS_FILE = APP_DIR / "vlm_presets.json"
@@ -740,6 +741,17 @@ def extract_png_metadata(image_path: str) -> dict:
                         _remember_lora(value.get("lora"), value.get("strength"))
                 if "modelsamplingsd3" in class_type_l and "model" in inputs and not result["params"].get("model"):
                     result["params"]["model"] = inputs["model"]
+                if "negative" in inputs and not result["negative_prompt"]:
+                    negative_node = _get_prompt_node(inputs.get("negative"))
+                    if negative_node:
+                        neg_inputs = negative_node.get("inputs", {})
+                        if isinstance(neg_inputs, dict):
+                            for neg_key in ("text", "prompt", "negative", "negative_prompt"):
+                                neg_text = neg_inputs.get(neg_key)
+                                if isinstance(neg_text, str) and len(neg_text.strip()) > len(result["negative_prompt"]):
+                                    result["negative_prompt"] = neg_text.strip()
+                                    found = True
+                                    break
 
         if lora_resources:
             result["params"]["civitai_resources"] = lora_resources
@@ -1045,9 +1057,104 @@ def format_metadata_display(metadata: dict) -> str:
     return "\n".join(lines)
 
 def build_civitai_parameters_text(metadata: dict) -> str:
-    prompt_text = (metadata.get("prompt_text") or "").strip()
-    negative_prompt = (metadata.get("negative_prompt") or "").strip()
+    def _normalize_prompt_block(value: Any) -> str:
+        if value is None:
+            return ""
+        text = str(value).replace("\r", "\n")
+        parts = [segment.strip() for segment in re.split(r"\n+", text) if segment.strip()]
+        return " ".join(parts).strip()
+
+    def _normalize_resources(value: Any) -> Any:
+        def _clean_model_name(raw: Any) -> str:
+            text = str(raw or "").strip()
+            if not text:
+                return ""
+            text = os.path.basename(text.replace("\\", "/"))
+            text = re.sub(r"\.(safetensors|ckpt|pt|bin|gguf)$", "", text, flags=re.IGNORECASE)
+            return text.strip()
+
+        if isinstance(value, list):
+            cleaned = []
+            for item in value:
+                if not isinstance(item, dict):
+                    cleaned.append(item)
+                    continue
+                model_name = _clean_model_name(item.get("modelName") or item.get("name"))
+                weight = item.get("weight")
+                if not model_name or model_name.lower() == "none":
+                    continue
+                if weight in (0, 0.0, "0", "0.0", "", None):
+                    continue
+                new_item = dict(item)
+                new_item["modelName"] = model_name
+                cleaned.append(new_item)
+            return cleaned
+        return value
+
+    def _format_sampler_for_civitai(sampler: Any, scheduler: Any) -> str:
+        sampler_name = str(sampler or "").strip()
+        scheduler_name = str(scheduler or "").strip()
+        if not sampler_name:
+            return ""
+        sampler_map = {
+            "euler": "Euler",
+            "euler_ancestral": "Euler a",
+            "heun": "Heun",
+            "dpm_2": "DPM2",
+            "dpm_2_ancestral": "DPM2 a",
+            "lms": "LMS",
+            "dpm_fast": "DPM fast",
+            "dpm_adaptive": "DPM adaptive",
+            "dpmpp_2s_ancestral": "DPM++ 2S a",
+            "dpmpp_sde": "DPM++ SDE",
+            "dpmpp_sde_gpu": "DPM++ SDE",
+            "dpmpp_2m": "DPM++ 2M",
+            "dpmpp_2m_sde": "DPM++ 2M SDE",
+            "dpmpp_2m_sde_gpu": "DPM++ 2M SDE",
+            "ddim": "DDIM",
+            "plms": "PLMS",
+            "uni_pc": "UniPC",
+            "uni_pc_bh2": "UniPC",
+            "lcm": "LCM",
+        }
+        base = sampler_map.get(sampler_name, sampler_name)
+        if not scheduler_name or scheduler_name == "normal":
+            return base
+        if scheduler_name == "karras":
+            return f"{base} Karras"
+        if scheduler_name == "exponential":
+            return f"{base} Exponential"
+        return f"{base}_{scheduler_name}"
+
+    def _format_lora_tags(resources: Any) -> str:
+        if not isinstance(resources, list):
+            return ""
+        tags = []
+        for item in resources:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("type") or "").lower() != "lora":
+                continue
+            model_name = str(item.get("modelName") or "").strip()
+            weight = item.get("weight")
+            if not model_name:
+                continue
+            try:
+                weight_text = f"{float(weight):g}"
+            except Exception:
+                weight_text = str(weight).strip()
+            if not weight_text:
+                continue
+            tags.append(f"<lora:{model_name}:{weight_text}>")
+        return " ".join(tags)
+
+    prompt_text = _normalize_prompt_block(metadata.get("prompt_text"))
+    negative_prompt = _normalize_prompt_block(metadata.get("negative_prompt"))
     params = metadata.get("params", {}) or {}
+    civitai_resources = _normalize_resources(params.get("civitai_resources"))
+    lora_tags = _format_lora_tags(civitai_resources)
+    if lora_tags:
+        prompt_text = f"{prompt_text} {lora_tags}".strip() if prompt_text else lora_tags
 
     lines = []
     if prompt_text:
@@ -1066,8 +1173,8 @@ def build_civitai_parameters_text(metadata: dict) -> str:
         kv_parts.append(f"{label}: {value_text}")
 
     add_pair("Steps", params.get("steps"))
-    add_pair("Sampler", params.get("sampler"))
-    add_pair("Scheduler", params.get("scheduler"))
+    sampler_label = _format_sampler_for_civitai(params.get("sampler"), params.get("scheduler"))
+    add_pair("Sampler", sampler_label or params.get("sampler"))
     add_pair("CFG scale", params.get("cfg"))
     add_pair("Seed", params.get("seed"))
     if params.get("width") and params.get("height"):
@@ -1093,17 +1200,11 @@ def build_civitai_parameters_text(metadata: dict) -> str:
     add_pair("Hires scheduler", params.get("hires_scheduler"))
     add_pair("RNG", params.get("rng"))
     add_pair("Version", params.get("version"))
-    civitai_resources = params.get("civitai_resources")
-    if civitai_resources:
-        if not isinstance(civitai_resources, str):
-            civitai_resources = json.dumps(civitai_resources, ensure_ascii=False, separators=(",", ":"))
-        add_pair("Civitai resources", civitai_resources)
-
     if kv_parts:
         lines.append(", ".join(kv_parts))
     return "\n".join(lines).strip()
 
-def rewrite_png_metadata_for_civitai(image_path: str) -> Dict[str, Any]:
+def rewrite_png_metadata_for_civitai(image_path: str, output_path: Optional[str] = None) -> Dict[str, Any]:
     out: Dict[str, Any] = {"success": False, "error": None, "metadata": None}
     if not image_path:
         out["error"] = "Please upload a PNG image first."
@@ -1119,6 +1220,7 @@ def rewrite_png_metadata_for_civitai(image_path: str) -> Dict[str, Any]:
     try:
         metadata = extract_png_metadata(image_path)
         prompt_text = (metadata.get("prompt_text") or "").strip()
+        target_path = output_path or image_path
 
         with Image.open(image_path) as img:
             if str(img.format).upper() != "PNG":
@@ -1151,6 +1253,30 @@ def rewrite_png_metadata_for_civitai(image_path: str) -> Dict[str, Any]:
                     return ""
                 return str(value)
 
+            def _to_civitai_png_text(value: Any) -> str:
+                text = _to_text(value).replace("\r\n", "\n").replace("\r", "\n")
+                if not text:
+                    return ""
+                replacements = {
+                    "\u2014": "-",
+                    "\u2013": "-",
+                    "\u2018": "'",
+                    "\u2019": "'",
+                    "\u201c": '"',
+                    "\u201d": '"',
+                    "\u2026": "...",
+                    "\u00a0": " ",
+                }
+                for src, dst in replacements.items():
+                    text = text.replace(src, dst)
+                try:
+                    text.encode("latin-1")
+                    return text
+                except UnicodeEncodeError:
+                    normalized = unicodedata.normalize("NFKD", text)
+                    ascii_text = normalized.encode("ascii", errors="ignore").decode("ascii")
+                    return ascii_text or text.encode("latin-1", errors="ignore").decode("latin-1", errors="ignore")
+
             for key, value in source_info.items():
                 key_text = str(key)
                 if key_text.lower() in {"parameters", "comment", "description"}:
@@ -1162,38 +1288,43 @@ def rewrite_png_metadata_for_civitai(image_path: str) -> Dict[str, Any]:
 
             # Keep A1111/Civitai-compatible primary field and add common fallbacks
             # used by metadata editors that parse generic comment/description tags.
-            pnginfo.add_text("parameters", civitai_parameters)
-            pnginfo.add_text("Comment", civitai_parameters)
+            pnginfo.add_text("parameters", _to_civitai_png_text(civitai_parameters), zip=False)
+            pnginfo.add_text("Comment", _to_civitai_png_text(civitai_parameters), zip=False)
             if prompt_text:
-                pnginfo.add_text("Description", prompt_text)
+                pnginfo.add_text("Description", _to_civitai_png_text(prompt_text), zip=False)
 
             save_kwargs: Dict[str, Any] = {"pnginfo": pnginfo}
             for preserve_key in ("icc_profile", "exif", "dpi", "gamma", "transparency"):
                 if preserve_key in source_info:
                     save_kwargs[preserve_key] = source_info[preserve_key]
 
-            img.save(image_path, format="PNG", **save_kwargs)
+            img.save(target_path, format="PNG", **save_kwargs)
 
-        refreshed = extract_png_metadata(image_path)
+        refreshed = extract_png_metadata(target_path)
         out["success"] = True
         out["metadata"] = refreshed
+        out["path"] = target_path
         return out
     except Exception as e:
         out["error"] = f"Failed to rewrite metadata: {e}"
         return out
 
-def create_fixed_metadata_download_copy(image_path: str) -> Optional[str]:
+def create_fixed_metadata_copy_path(image_path: str) -> Optional[str]:
     if not image_path:
         return None
     try:
         src = Path(image_path)
-        if not src.exists():
-            return None
         suffix = src.suffix or ".png"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp_path = Path(tmp.name)
-        shutil.copy2(src, tmp_path)
-        return str(tmp_path)
+        FIXED_META_DIR.mkdir(parents=True, exist_ok=True)
+        base_name = src.stem or f"image_{int(time.time())}"
+        candidate = FIXED_META_DIR / f"{base_name}_fixed{suffix}"
+        if src.exists():
+            try:
+                if candidate.resolve() == src.resolve():
+                    candidate = FIXED_META_DIR / f"{base_name}_fixed_copy{suffix}"
+            except Exception:
+                pass
+        return str(candidate)
     except Exception:
         return None
 
@@ -2376,7 +2507,7 @@ with gr.Blocks() as demo:
                     mode_sel = gr.Dropdown(choices=pipeline_preset_manager.keys(), label="Pipeline Preset", value="Default")
                     compile_btn = gr.Button("🚀 Compile prompt", variant="primary")
                     with gr.Accordion("Get PNG info", open=False):
-                        gr.Markdown("*Upload PNG to extract prompt metadata*")
+                        gr.Markdown("*Upload PNG to extract prompt metadata. After `Fix meta`, use the generated `Fixed PNG download` file or the sibling `*_fixed.png` on disk, not browser Save image.*")
                         png_meta_image = gr.Image(label="PNG image", type="filepath", height=220)
                         png_meta_output = gr.Textbox(
                             label="PNG info",
@@ -2569,22 +2700,23 @@ with gr.Blocks() as demo:
         return display, gr.update(), gr.update(value=None, visible=False)
 
     def on_fix_meta_click(image_path):
-        result = rewrite_png_metadata_for_civitai(image_path)
+        fixed_path = create_fixed_metadata_copy_path(image_path)
+        result = rewrite_png_metadata_for_civitai(image_path, fixed_path)
         if not result.get("success"):
             err_msg = result.get('error') or 'Unable to update metadata'
             gr.Warning(f"Fix meta failed: {err_msg}")
             return f"⚠️ {err_msg}", gr.update(), gr.update(), gr.update(value=None, visible=False)
 
-        metadata = result.get("metadata") or extract_png_metadata(image_path)
+        output_path = result.get("path") or fixed_path or image_path
+        metadata = result.get("metadata") or extract_png_metadata(output_path)
         display = format_metadata_display(metadata)
-        download_copy = create_fixed_metadata_download_copy(image_path)
         gr.Info("Fix meta completed successfully.")
-        out_text = f"✅ Civitai metadata updated.\n\n{display}"
+        out_text = f"✅ Civitai metadata updated.\nSaved as: {output_path}\nUse `Fixed PNG download` or this sibling file on disk.\n\n{display}"
         prompt_text = (metadata.get("prompt_text") or "").strip()
-        file_update = gr.update(value=download_copy, visible=bool(download_copy))
+        file_update = gr.update(value=output_path, visible=bool(output_path))
         if prompt_text:
-            return out_text, prompt_text, gr.update(value=image_path), file_update
-        return out_text, gr.update(), gr.update(value=image_path), file_update
+            return out_text, prompt_text, gr.update(value=output_path), file_update
+        return out_text, gr.update(), gr.update(value=output_path), file_update
 
     png_meta_image.change(
         fn=on_png_info_image_change,
