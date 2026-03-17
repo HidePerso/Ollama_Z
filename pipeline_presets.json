@@ -34,5 +34,11 @@
     "extractor": "ZImage Anchor Expander",
     "structurer": "",
     "validator": ""
+  },
+  "translator": {
+    "translator": "translator",
+    "extractor": "",
+    "structurer": "",
+    "validator": ""
   }
 }

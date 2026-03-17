@@ -394,13 +394,26 @@ def extract_png_metadata(image_path: str) -> dict:
             return ""
         if isinstance(value, bytes):
             raw = value
+            encodings = []
             # EXIF UserComment often starts with an 8-byte charset prefix:
             # ASCII\x00\x00\x00 / UNICODE\x00 / JIS\x00...
             if len(raw) >= 8:
                 head = raw[:8]
-                if head.startswith(b"ASCII\x00\x00\x00") or head.startswith(b"UNICODE\x00") or head.startswith(b"JIS\x00\x00\x00\x00\x00"):
+                if head.startswith(b"ASCII\x00\x00\x00"):
+                    encodings = ["utf-8", "latin-1"]
                     raw = raw[8:]
-            for enc in ("utf-8", "utf-16", "utf-16le", "latin-1"):
+                elif head.startswith(b"UNICODE\x00"):
+                    raw = raw[8:]
+                    even_zeros = sum(1 for b in raw[0::2][:32] if b == 0)
+                    odd_zeros = sum(1 for b in raw[1::2][:32] if b == 0)
+                    # Civitai JPEGs may use either UTF-16BE or UTF-16LE in EXIF UserComment.
+                    encodings = ["utf-16be", "utf-16le", "utf-16"] if even_zeros > odd_zeros else ["utf-16le", "utf-16be", "utf-16"]
+                elif head.startswith(b"JIS\x00\x00\x00\x00\x00"):
+                    encodings = ["shift_jis", "utf-8", "latin-1"]
+                    raw = raw[8:]
+            if not encodings:
+                encodings = ["utf-8", "utf-16", "utf-16le", "utf-16be", "latin-1"]
+            for enc in encodings:
                 try:
                     return raw.decode(enc, errors="ignore").strip("\x00")
                 except Exception:
@@ -659,17 +672,19 @@ def extract_png_metadata(image_path: str) -> dict:
 
     try:
         from PIL import Image
+        from PIL.ExifTags import Base
     except Exception as e:
         result["error"] = f"Pillow import error: {e}"
         return result
 
     try:
         with Image.open(image_path) as img:
-            if not hasattr(img, "info") or not img.info:
-                result["error"] = "No metadata found in image"
-                return result
-
-            text_meta = {str(k): _to_text(v) for k, v in img.info.items() if _to_text(v)}
+            info_items = getattr(img, "info", {}) or {}
+            text_meta = {}
+            for k, v in info_items.items():
+                text_val = _to_text(v)
+                if text_val:
+                    text_meta[str(k)] = text_val
 
             parsed_any = False
             raw_prompt = text_meta.get("prompt")
@@ -699,6 +714,17 @@ def extract_png_metadata(image_path: str) -> dict:
                             continue
                         parsed_any = _fill_from_comfy_prompt(raw_exif) or parsed_any
                         parsed_any = _fill_from_a1111_parameters(raw_exif) or parsed_any
+                    try:
+                        nested_exif = exif.get_ifd(Base.ExifOffset)
+                    except Exception:
+                        nested_exif = None
+                    if isinstance(nested_exif, dict):
+                        for tag_id in (0x9286, 0x010E):  # UserComment, ImageDescription
+                            raw_nested = _to_text(nested_exif.get(tag_id))
+                            if not raw_nested:
+                                continue
+                            parsed_any = _fill_from_comfy_prompt(raw_nested) or parsed_any
+                            parsed_any = _fill_from_a1111_parameters(raw_nested) or parsed_any
 
             if not result["prompt_text"]:
                 for key in ("prompt", "Prompt", "Description", "description"):
