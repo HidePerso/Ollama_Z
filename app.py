@@ -16,6 +16,7 @@ import shlex
 import shutil
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
+import tempfile
 
 # Try to import GPUtil for GPU monitoring
 try:
@@ -1180,6 +1181,21 @@ def rewrite_png_metadata_for_civitai(image_path: str) -> Dict[str, Any]:
     except Exception as e:
         out["error"] = f"Failed to rewrite metadata: {e}"
         return out
+
+def create_fixed_metadata_download_copy(image_path: str) -> Optional[str]:
+    if not image_path:
+        return None
+    try:
+        src = Path(image_path)
+        if not src.exists():
+            return None
+        suffix = src.suffix or ".png"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = Path(tmp.name)
+        shutil.copy2(src, tmp_path)
+        return str(tmp_path)
+    except Exception:
+        return None
 
 
 def get_model_capabilities(model_name: str) -> set:
@@ -2367,6 +2383,11 @@ with gr.Blocks() as demo:
                             lines=8,
                             interactive=False
                         )
+                        fixed_meta_file = gr.File(
+                            label="Fixed PNG download",
+                            interactive=False,
+                            visible=False
+                        )
                         with gr.Row():
                             fix_meta_btn = gr.Button(
                                 "Fix meta",
@@ -2539,39 +2560,41 @@ with gr.Blocks() as demo:
 
     def on_png_info_image_change(image_path):
         if not image_path:
-            return "", gr.update()
+            return "", gr.update(), gr.update(value=None, visible=False)
         metadata = extract_png_metadata(image_path)
         display = format_metadata_display(metadata)
         prompt_text = (metadata.get("prompt_text") or "").strip()
         if prompt_text:
-            return display, prompt_text
-        return display, gr.update()
+            return display, prompt_text, gr.update(value=None, visible=False)
+        return display, gr.update(), gr.update(value=None, visible=False)
 
     def on_fix_meta_click(image_path):
         result = rewrite_png_metadata_for_civitai(image_path)
         if not result.get("success"):
             err_msg = result.get('error') or 'Unable to update metadata'
             gr.Warning(f"Fix meta failed: {err_msg}")
-            return f"⚠️ {err_msg}", gr.update()
+            return f"⚠️ {err_msg}", gr.update(), gr.update(), gr.update(value=None, visible=False)
 
         metadata = result.get("metadata") or extract_png_metadata(image_path)
         display = format_metadata_display(metadata)
+        download_copy = create_fixed_metadata_download_copy(image_path)
         gr.Info("Fix meta completed successfully.")
         out_text = f"✅ Civitai metadata updated.\n\n{display}"
         prompt_text = (metadata.get("prompt_text") or "").strip()
+        file_update = gr.update(value=download_copy, visible=bool(download_copy))
         if prompt_text:
-            return out_text, prompt_text
-        return out_text, gr.update()
+            return out_text, prompt_text, gr.update(value=image_path), file_update
+        return out_text, gr.update(), gr.update(value=image_path), file_update
 
     png_meta_image.change(
         fn=on_png_info_image_change,
         inputs=[png_meta_image],
-        outputs=[png_meta_output, input_text]
+        outputs=[png_meta_output, input_text, fixed_meta_file]
     )
     fix_meta_btn.click(
         fn=on_fix_meta_click,
         inputs=[png_meta_image],
-        outputs=[png_meta_output, input_text]
+        outputs=[png_meta_output, input_text, png_meta_image, fixed_meta_file]
     )
 
     def on_get_description_click(image_path, current_text, selected_model, detail_mode):
